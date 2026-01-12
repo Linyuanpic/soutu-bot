@@ -3,19 +3,31 @@ export const DEFAULT_D1_BINDING = "DB";
 export const DEFAULT_KV_BINDING = "KV";
 export const TEMPLATE_SORT_ORDER = [
   "start",
+  "ask_code",
+  "support_open",
+  "support_closed",
+  "support_closed_spam",
+  "vip_new",
+  "vip_renew",
   "image_limit_nonmember",
   "image_limit_member",
-  "image_reply",
+  "image_limit",
+  "exp_before_30d",
+  "exp_before_15d",
+  "exp_before_7d",
+  "exp_before_3d",
+  "exp_before_1d",
+  "nonmember_monthly",
+  "exp_after_1d",
+  "exp_after_3d",
+  "exp_after_7d",
+  "exp_after_15d",
+  "exp_after_30d",
 ];
 export const IMAGE_REPLY_TEMPLATE_KEY = "image_reply";
+export const SUPPORT_CLOSED_TEMPLATE_KEY = "support_closed";
 export const IMAGE_LIMIT_MEMBER_TEMPLATE_KEY = "image_limit_member";
 export const IMAGE_LIMIT_NONMEMBER_TEMPLATE_KEY = "image_limit_nonmember";
-export const START_DEFAULT_TEXT = "/start 指令自动回复首页内容\n加入下方任意一个群组，都可免费无限次使用搜图机器人哦～";
-export const START_DEFAULT_BUTTONS = [
-  [{ text: "会员赞助", type: "url", url: "https://t.me/orzboy_bot?start=bUPHj9WUw0fmYEP" }],
-  [{ text: "资源合集", type: "url", url: "https://t.me/orzboy_bot?start=kY7cFpjD0fjsEO0" }],
-  [{ text: "查找出处", type: "url", url: "https://t.me/orzboy_bot?start=A9G93w5qiYAspSW" }]
-];
 export const IMAGE_REPLY_DEFAULT_TEXT = "自助搜图，具体内容点击下方按钮～";
 export const IMAGE_REPLY_DEFAULT_BUTTONS = [
   [{ text: "GoogleLens → 看看这是谁", type: "url", url: "{{google_lens}}" }],
@@ -27,8 +39,10 @@ export const IMAGE_PROXY_CACHE_TTL_SEC = 7 * 24 * 3600;
 export const IMAGE_PROXY_RATE_LIMIT = 3;
 export const IMAGE_PROXY_RATE_WINDOW = 60;
 export const FILE_PATH_CACHE_TTL = 7 * 24 * 3600;
+export const CARD_CODE_LENGTH = 18;
 export const IMAGE_DAILY_LIMIT_MEMBER = 100;
 export const IMAGE_DAILY_LIMIT_NON_MEMBER = 5;
+export const SUPPORT_SPAM_BAN_TTL_SEC = 60 * 60;
 export const WEEKDAY_INDEX = {
   Sun: 7,
   Mon: 1,

@@ -59,7 +59,7 @@ wrangler deploy
 
 ## 6. 设置 Telegram Webhook
 把 Webhook 指向：
-`https://<你的域名>/tg/webhook`
+`https://soutu.linyuan.cc/tg/webhook`
 
 命令：
 ```bash
@@ -71,7 +71,7 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook"   -H "content-
 ## 7. 绑定自定义域名（可选）
 在 Cloudflare Dashboard → Workers & Pages → 你的 Worker → Triggers → Custom Domains
 绑定你自己的域名，比如：
-`bot.example.com`
+`soutu.linyuan.cc`
 
 然后 webhook 指向：
 `https://soutu.linyuan.cc/tg/webhook`

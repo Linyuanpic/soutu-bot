@@ -4,26 +4,33 @@ import {
   IMAGE_REPLY_DEFAULT_BUTTONS,
   IMAGE_REPLY_DEFAULT_TEXT,
   IMAGE_REPLY_TEMPLATE_KEY,
-  START_DEFAULT_BUTTONS,
-  START_DEFAULT_TEXT,
+  SUPPORT_CLOSED_TEMPLATE_KEY,
+  SUPPORT_SPAM_BAN_TTL_SEC,
   TEMPLATE_SORT_ORDER,
   JSON_HEADERS,
 } from "./config.js";
-import { ensureUser, getDb, getTemplate, recordVipMember } from "./db.js";
+import { ensureUser, getDb, getTemplate } from "./db.js";
 import { getKv } from "./kv.js";
 import { isMember } from "./auth.js";
+import { extractCardCode, handleCardRedeem, isLikelyCardCode } from "./card.js";
+import { ensureVipInviteLink } from "./group.js";
 import {
   buildImageSearchLinks,
   buildSignedProxyUrl,
   checkDailyImageLimit,
+  recordDailyImageReminder,
   getTelegramFilePath,
   shouldNotifyImageLimit,
+  shouldNotifyMediaGroup,
+  shouldNotifyVideoWarning,
 } from "./image.js";
 import { ensureBotCommands, sendTemplate, tgCall, trySendMessage } from "./telegram.js";
 import {
+  appendFixedStartButtons,
   buildKeyboard,
   buildUserDisplay,
   buildUserStatusLabel,
+  escapeHtmlText,
   fmtDateTime,
   getMessageImageInfo,
   getTzParts,
@@ -31,12 +38,268 @@ import {
   getTzDayStart,
   getTzWeekStart,
   isPrivateChat,
+  isVideoMessage,
   normalizeTelegramHtml,
   nowSec,
   parseAdminIds,
+  randCode,
   renderButtonsWithVars,
   renderTemplateText,
 } from "./utils.js";
+
+/** Support session helpers */
+export async function openSupport(env, userId) {
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO support_sessions(user_id,is_open,updated_at) VALUES (?,?,?)
+     ON CONFLICT(user_id) DO UPDATE SET is_open=excluded.is_open, updated_at=excluded.updated_at`
+  ).bind(userId, 1, t).run();
+  await getKv(env).put(`support_open:${userId}`, String(t + 600), { expirationTtl: 600 });
+}
+
+export async function closeSupport(env, userId) {
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO support_sessions(user_id,is_open,updated_at) VALUES (?,?,?)
+     ON CONFLICT(user_id) DO UPDATE SET is_open=excluded.is_open, updated_at=excluded.updated_at`
+  ).bind(userId, 0, t).run();
+  await getKv(env).delete(`support_open:${userId}`);
+}
+
+export async function isSupportOpen(env, userId) {
+  const kvVal = await getKv(env).get(`support_open:${userId}`);
+  if (kvVal) return true;
+  const row = await getDb(env).prepare(`SELECT is_open FROM support_sessions WHERE user_id=?`).bind(userId).first();
+  if (row && row.is_open === 1) await closeSupport(env, userId);
+  return false;
+}
+
+export async function isSupportBlocked(env, userId) {
+  const row = await getDb(env).prepare(`SELECT support_blocked FROM users WHERE user_id=?`).bind(userId).first();
+  return row && row.support_blocked === 1;
+}
+
+export async function isSupportTempBanned(env, userId) {
+  const key = `support_ban:${userId}`;
+  const bannedUntil = await getKv(env).get(key);
+  if (!bannedUntil) return false;
+  if (Number(bannedUntil) > nowSec()) return true;
+  await getKv(env).delete(key);
+  return false;
+}
+
+export async function setSupportTempBanned(env, userId, ttlSec) {
+  const until = nowSec() + ttlSec;
+  await getKv(env).put(`support_ban:${userId}`, String(until), { expirationTtl: ttlSec });
+  await closeSupport(env, userId);
+}
+
+export async function setSupportBlocked(env, userId, blocked) {
+  await getDb(env).prepare(`UPDATE users SET support_blocked=? WHERE user_id=?`).bind(blocked ? 1 : 0, userId).run();
+  if (blocked) await closeSupport(env, userId);
+}
+
+export async function checkSpamAndMaybeClose(env, userId) {
+  const key = `support_spam:${userId}`;
+  const t = Date.now();
+  const raw = await getKv(env).get(key);
+  let state = raw ? JSON.parse(raw) : { winStart: t, count: 0, mutedUntil: 0 };
+
+  if (state.mutedUntil && t < state.mutedUntil) return { muted: true, closedNow: false };
+
+  if (t - state.winStart > 3000) {
+    state.winStart = t;
+    state.count = 0;
+  }
+  state.count += 1;
+
+  if (state.count > 5) {
+    // close support and ban for 1 hour
+    state.mutedUntil = t + SUPPORT_SPAM_BAN_TTL_SEC * 1000;
+    await getKv(env).put(key, JSON.stringify(state), { expirationTtl: 3600 });
+    await setSupportTempBanned(env, userId, SUPPORT_SPAM_BAN_TTL_SEC);
+    return { muted: true, closedNow: true, banned: true };
+  }
+
+  await getKv(env).put(key, JSON.stringify(state), { expirationTtl: 3600 });
+  return { muted: false, closedNow: false };
+}
+
+const MEDIA_GROUP_BUFFER_MS = 500;
+const mediaGroupBuffers = new Map();
+
+function buildMediaGroupItem(msg, includeCaption) {
+  if (!msg) return null;
+  if (msg.photo?.length) {
+    const item = { type: "photo", media: msg.photo[msg.photo.length - 1].file_id };
+    if (includeCaption && msg.caption) item.caption = msg.caption;
+    return item;
+  }
+  if (msg.video?.file_id) {
+    const item = { type: "video", media: msg.video.file_id };
+    if (includeCaption && msg.caption) item.caption = msg.caption;
+    return item;
+  }
+  if (msg.document?.file_id) {
+    const item = { type: "document", media: msg.document.file_id };
+    if (includeCaption && msg.caption) item.caption = msg.caption;
+    return item;
+  }
+  if (msg.audio?.file_id) {
+    const item = { type: "audio", media: msg.audio.file_id };
+    if (includeCaption && msg.caption) item.caption = msg.caption;
+    return item;
+  }
+  return null;
+}
+
+async function flushSupportMediaGroup(env, groupId) {
+  const entry = mediaGroupBuffers.get(groupId);
+  if (!entry) return;
+  mediaGroupBuffers.delete(groupId);
+  const messages = entry.messages.slice().sort((a, b) => (a.message_id || 0) - (b.message_id || 0));
+  const media = [];
+  let captionAdded = false;
+  const fallback = [];
+  for (const msg of messages) {
+    const item = buildMediaGroupItem(msg, !captionAdded);
+    if (!item) {
+      fallback.push(msg);
+      continue;
+    }
+    if (item.caption) captionAdded = true;
+    media.push(item);
+  }
+  const adminIds = parseAdminIds(env);
+  if (media.length) {
+    for (const adminId of adminIds) {
+      const forwarded = await tgCall(env, "sendMediaGroup", { chat_id: adminId, media });
+      if (Array.isArray(forwarded)) {
+        for (const forwardedMsg of forwarded) {
+          await storeSupportForwardMap(env, adminId, forwardedMsg?.message_id, entry.userId);
+        }
+      }
+    }
+  }
+  if (fallback.length) {
+    for (const msg of fallback) {
+      for (const adminId of adminIds) {
+        const forwarded = await tgCall(env, "forwardMessage", {
+          chat_id: adminId,
+          from_chat_id: entry.userId,
+          message_id: msg.message_id
+        });
+        await storeSupportForwardMap(env, adminId, forwarded?.message_id, entry.userId);
+      }
+    }
+  }
+}
+
+function bufferSupportMediaGroup(env, msg) {
+  const groupId = msg.media_group_id;
+  if (!groupId) return Promise.resolve();
+  let entry = mediaGroupBuffers.get(groupId);
+  if (!entry) {
+    entry = { messages: [], timer: null, promise: null, resolve: null, userId: msg.from?.id };
+    entry.promise = new Promise((resolve) => {
+      entry.resolve = resolve;
+    });
+    mediaGroupBuffers.set(groupId, entry);
+  }
+  if (!entry.userId) entry.userId = msg.from?.id;
+  entry.messages.push(msg);
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(async () => {
+    try {
+      await flushSupportMediaGroup(env, groupId);
+    } finally {
+      entry.resolve?.();
+    }
+  }, MEDIA_GROUP_BUFFER_MS);
+  return entry.promise;
+}
+
+async function sendSupportClosedNotice(env, chatId) {
+  await tgCall(env, "sendMessage", { chat_id: chatId, text: "客服通道已关闭～" });
+}
+
+function getForwardedUserId(msg) {
+  const reply = msg?.reply_to_message;
+  if (!reply) return null;
+  const id =
+    reply?.forward_from?.id ??
+    reply?.forward_origin?.sender_user?.id ??
+    reply?.forward_origin?.sender_user_id ??
+    reply?.forward_from_chat?.id ??
+    null;
+  return Number.isFinite(id) ? id : null;
+}
+
+async function getForwardedUserIdFromKv(env, msg) {
+  const reply = msg?.reply_to_message;
+  const chatId = msg?.chat?.id;
+  if (!reply || !Number.isFinite(chatId)) return null;
+  const messageId = reply?.message_id;
+  if (!Number.isFinite(messageId)) return null;
+  const kv = getKv(env);
+  if (!kv) return null;
+  const stored = await kv.get(`support_forward:${chatId}:${messageId}`);
+  if (!stored) return null;
+  const parsed = Number(stored);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function resolveSupportUserId(env, msg) {
+  const direct = getForwardedUserId(msg);
+  if (direct) return direct;
+  return await getForwardedUserIdFromKv(env, msg);
+}
+
+async function storeSupportForwardMap(env, adminId, messageId, userId) {
+  if (!Number.isFinite(adminId) || !Number.isFinite(messageId) || !Number.isFinite(userId)) return;
+  const kv = getKv(env);
+  if (!kv) return;
+  await kv.put(`support_forward:${adminId}:${messageId}`, String(userId), { expirationTtl: 86400 });
+}
+
+async function getSupportUserProfile(env, userId) {
+  if (!Number.isFinite(userId)) return null;
+  const row = await getDb(env).prepare(
+    `SELECT user_id, username, first_name, last_name
+     FROM users
+     WHERE user_id=?`
+  ).bind(userId).first();
+  return row || null;
+}
+
+function buildSupportUserInfoText(profile, isVip, userId) {
+  const name = [profile?.first_name, profile?.last_name].filter(Boolean).join(" ")
+    || profile?.username
+    || String(userId || "");
+  const infoLines = [
+    `姓名：${escapeHtmlText(name)}`,
+    `用户ID：${userId}`,
+    `身份：${isVip ? "会员用户" : "普通用户"}`,
+    "—————————————",
+  ];
+  infoLines.push(
+    `回复：<code>${escapeHtmlText(`/reply ${userId}`)}</code>`,
+    `屏蔽：<code>${escapeHtmlText(`/block ${userId}`)}</code>`,
+    `解除：<code>${escapeHtmlText(`/unblock ${userId}`)}</code>`
+  );
+  return infoLines.join("\n");
+}
+
+async function shouldNotifySupportMediaGroup(env, groupId) {
+  if (!groupId) return true;
+  const kv = getKv(env);
+  if (!kv) return true;
+  const key = `support_media_group_notice:${groupId}`;
+  const notified = await kv.get(key);
+  if (notified) return false;
+  await kv.put(key, "1", { expirationTtl: 120 });
+  return true;
+}
 
 /** Admin login: /login in bot DM generates a one-time link */
 export async function handleAdminLoginCommand(env, msg, origin) {
@@ -209,7 +472,10 @@ export function adminHtml() {
         <a href="#dashboard" id="nav-dashboard">数据看板</a>
         <a href="#templates" id="nav-templates">回复模版</a>
         <a href="#broadcast" id="nav-broadcast">广播中心</a>
+        <a href="#codes" id="nav-codes">卡密管理</a>
+        <a href="#support" id="nav-support">客服会话</a>
         <a href="#chats" id="nav-chats">群组管理</a>
+        <a href="#members" id="nav-members">会员管理</a>
         <a href="#users" id="nav-users">用户管理</a>
       </nav>
     </aside>
@@ -235,17 +501,13 @@ export function adminHtml() {
         <div class="dash-chart-grid">
           <div class="card dash-chart-card">
             <div class="dash-chart-head">
-              <h4>近一周新增用户/会员</h4>
-              <div class="dash-legend">
-                <span><i></i>新增用户</span>
-                <span><i class="legend-secondary"></i>新增会员</span>
-              </div>
+              <h4>近一周关注机器人用户</h4>
             </div>
-            <div id="dashUserChart" class="dash-chart"></div>
+            <div id="dashFollowChart" class="dash-chart"></div>
           </div>
           <div class="card dash-chart-card">
             <div class="dash-chart-head">
-              <h4>近一周搜图数量与人数</h4>
+              <h4>近一周发图数量与人数</h4>
               <div class="dash-legend">
                 <span><i></i>数量</span>
                 <span><i class="legend-secondary"></i>人数</span>
@@ -331,6 +593,41 @@ export function adminHtml() {
         <p class="muted" id="tplMsg"></p>
       </div>
 
+      <div class="card hidden" id="view-codes">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <h3 style="margin:0">卡密管理</h3>
+        </div>
+        <div class="code-toolbar-grid" style="padding-right:6px">
+          <div class="code-toolbar-search"><input id="codeSearch" placeholder="搜索卡密/状态/用户ID" /></div>
+          <button class="gray action-btn" id="codeRefresh">刷新</button>
+          <button class="action-btn" id="genCodesBtn">+ 批量生成</button>
+        </div>
+        <div class="card hidden" id="genCodesCard" style="margin-top:8px">
+          <h4>批量生成</h4>
+          <div class="gen-grid">
+            <div class="field">
+              <label>数量</label>
+              <input id="genCount" value="10" />
+            </div>
+            <div class="field">
+              <label>时长（天）</label>
+              <input id="genDays" value="365" />
+            </div>
+            <div class="field">
+              <label>卡密长度</label>
+              <input id="genLen" value="18" disabled />
+            </div>
+            <div class="action-group">
+              <button class="action-btn" id="doGenBtn">生成</button>
+              <button class="gray action-btn" id="copyGenBtn">复制全部卡密</button>
+            </div>
+          </div>
+          <textarea id="genResult" class="code-output" placeholder="生成结果会显示在这里（可复制）"></textarea>
+          <p class="muted" id="genMsg"></p>
+        </div>
+        <div id="codeTable"></div>
+      </div>
+
       <div class="card hidden" id="view-broadcast">
         <h3>广播中心</h3>
         <div class="row bc-row">
@@ -338,6 +635,8 @@ export function adminHtml() {
             <label>人群</label>
             <select id="bcAudience">
               <option value="all">全部用户</option>
+              <option value="member">会员用户</option>
+              <option value="nonmember">非会员用户</option>
             </select>
           </div>
           <div class="field-key">
@@ -354,6 +653,22 @@ export function adminHtml() {
         </div>
         <p class="muted">提示：广播会分批发送，避免触发限制。可在下方查看任务状态。</p>
         <div id="bcJobs"></div>
+        
+        <hr/>
+        <h4>自动广播规则</h4>
+        <div id="autoRuleTable"></div>
+      </div>
+
+      <div class="card hidden" id="view-support">
+        <h3>客服会话</h3>
+        <p class="muted">用户消息会转发到管理员 Telegram。管理员在 TG 用 <b>/reply 用户ID 内容</b> 回复，或用 <b>/block 用户ID</b> 屏蔽。</p>
+        <div class="row row-between">
+          <div style="flex:1;min-width:220px">
+            <input id="supportSearch" placeholder="搜索用户昵称 / 用户ID" />
+          </div>
+        </div>
+        <div id="supportList"></div>
+        <div id="supportPagination" class="pagination"></div>
       </div>
 
       <div class="card hidden" id="view-chats">
@@ -400,6 +715,19 @@ export function adminHtml() {
         <div id="chatTable"></div>
       </div>
 
+      <div class="card hidden" id="view-members">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <h3 style="margin:0">会员管理</h3>
+        </div>
+        <div class="row row-between">
+          <div style="flex:1;min-width:220px">
+            <input id="memberSearch" placeholder="搜索用户昵称 / 用户ID" />
+          </div>
+        </div>
+        <div id="memberTable"></div>
+        <div id="memberPagination" class="pagination"></div>
+      </div>
+
       <div class="card hidden" id="view-users">
         <div class="row" style="justify-content:space-between;align-items:center">
           <h3 style="margin:0">用户管理</h3>
@@ -417,7 +745,7 @@ export function adminHtml() {
 
 <script>
   function $(id){ return document.getElementById(id); }
-  var views = ["login","dashboard","templates","template-editor","broadcast","chats","users"];
+  var views = ["login","dashboard","templates","template-editor","broadcast","codes","support","chats","members","users"];
   var IMAGE_REPLY_TEMPLATE_KEY = ${JSON.stringify(IMAGE_REPLY_TEMPLATE_KEY)};
   var IMAGE_REPLY_DEFAULT_TEXT = ${JSON.stringify(IMAGE_REPLY_DEFAULT_TEXT)};
   var IMAGE_REPLY_DEFAULT_BUTTONS = ${JSON.stringify(IMAGE_REPLY_DEFAULT_BUTTONS)};
@@ -432,8 +760,11 @@ export function adminHtml() {
     if(name==="dashboard") { loadDashboard(); }
     if(name==="templates") loadTemplates();
     if(name==="template-editor") loadTemplateEditorFromUrl();
-    if(name==="broadcast") { loadBroadcastJobs(); }
+    if(name==="codes") loadCodes();
+    if(name==="broadcast") { loadBroadcastJobs(); loadAutoRules(); }
+    if(name==="support") loadSupport();
     if(name==="chats") loadChats();
+    if(name==="members") loadMembers();
     if(name==="users") loadUsers();
     if(name==="login") { startLogin(); }
   }
@@ -589,17 +920,17 @@ export function adminHtml() {
       var d = await api("/api/admin/dashboard");
       var html = "";
       html += '<div class="dash-grid">';
-      html += '<div class="card dash-card" data-target="users" style="cursor:pointer"><div class="pill">本周新增用户</div><h2 class="dash-value">' + d.week_new_users + '</h2></div>';
-      html += '<div class="card dash-card" data-target="users" style="cursor:pointer"><div class="pill">本月新增用户</div><h2 class="dash-value">' + d.month_new_users + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本周搜图人数</div><h2 class="dash-value">' + d.week_image_users + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本月搜图人数</div><h2 class="dash-value">' + d.month_image_users + '</h2></div>';
-      html += '<div class="card dash-card" data-target="users" style="cursor:pointer"><div class="pill">本周新增会员</div><h2 class="dash-value">' + d.week_new_members + '</h2></div>';
-      html += '<div class="card dash-card" data-target="users" style="cursor:pointer"><div class="pill">本月新增会员</div><h2 class="dash-value">' + d.month_new_members + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本周搜图数量</div><h2 class="dash-value">' + d.week_images + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本月搜图数量</div><h2 class="dash-value">' + d.month_images + '</h2></div>';
+      html += '<div class="card dash-card" data-target="users" style="cursor:pointer"><div class="pill">全部用户</div><h2 class="dash-value">' + d.total_users + '</h2></div>';
+      html += '<div class="card dash-card" data-target="members" style="cursor:pointer"><div class="pill">会员用户</div><h2 class="dash-value">' + d.members + '</h2></div>';
+      html += '<div class="card dash-card" data-target="members" style="cursor:pointer"><div class="pill">即将到期</div><h2 class="dash-value">' + d.expiring_7d + '</h2></div>';
+      html += '<div class="card dash-card" data-target="members" style="cursor:pointer"><div class="pill">过期会员</div><h2 class="dash-value">' + d.expired + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本周关注</div><h2 class="dash-value">' + d.week_follow + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本月关注</div><h2 class="dash-value">' + d.month_follow + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本周搜图</div><h2 class="dash-value">' + d.week_images + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本月搜图</div><h2 class="dash-value">' + d.month_images + '</h2></div>';
       html += '</div>';
       $("dash").innerHTML = html;
-      renderDoubleBarChart("dashUserChart", d.weekly_user_member_series || []);
+      renderBarChart("dashFollowChart", d.weekly_follow_series || []);
       renderDoubleBarChart("dashImageChart", d.weekly_image_series || []);
       var codes = $("dash").querySelectorAll("[data-target]");
       for (var i=0;i<codes.length;i++){
@@ -610,8 +941,8 @@ export function adminHtml() {
       }
     }catch(e){
       $("dash").textContent = "请先登录。";
-      var userChart = $("dashUserChart");
-      if (userChart) userChart.innerHTML = "";
+      var followChart = $("dashFollowChart");
+      if (followChart) followChart.innerHTML = "";
       var imageChart = $("dashImageChart");
       if (imageChart) imageChart.innerHTML = "";
     }
@@ -994,6 +1325,101 @@ export function adminHtml() {
     }
   }
 
+  // Codes
+  var codeList = [];
+  function renderCodeTable(list){
+    var rows = "";
+    for (var i=0;i<list.length;i++){
+      var c = list[i];
+      rows += '<tr>';
+      rows += '<td><b>' + escapeHtml(c.code) + '</b><div class="muted">' + c.days + ' 天</div></td>';
+      rows += '<td class="center">' + escapeHtml(c.status) + '</td>';
+      rows += '<td class="col-user">' + escapeHtml(String(c.used_by||"")) + '</td>';
+      rows += '<td class="col-used">' + escapeHtml(c.used_at||"") + '</td>';
+      rows += '<td class="col-actions"><button class="red action-btn" data-del="' + escapeHtml(c.code) + '">删除</button></td>';
+      rows += '</tr>';
+    }
+    $("codeTable").innerHTML = '<table class="table-edge code-table"><thead><tr><th>卡密</th><th class="center">状态</th><th class="col-user">使用者</th><th class="col-used">使用时间</th><th class="col-actions">操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    var delBtns = $("codeTable").querySelectorAll("button[data-del]");
+    for (var j=0;j<delBtns.length;j++){
+      delBtns[j].onclick = function(){
+        var code = this.getAttribute("data-del");
+        deleteCode(code);
+      };
+    }
+  }
+
+  async function loadCodes(){
+    try{
+      var d = await api("/api/admin/codes");
+      codeList = d.items || [];
+      renderCodeTable(codeList);
+    }catch(e){
+      $("codeTable").textContent = "请先登录。";
+    }
+  }
+
+  $("codeRefresh").onclick = loadCodes;
+  $("codeSearch").oninput = function(){
+    var q = $("codeSearch").value.trim().toLowerCase();
+    if(!q) return renderCodeTable(codeList);
+    var f = [];
+    for (var i=0;i<codeList.length;i++){
+      var c = codeList[i];
+      var s = (c.code||"").toLowerCase() + " " + (c.status||"").toLowerCase() + " " + String(c.used_by||"");
+      if (s.indexOf(q) >= 0) f.push(c);
+    }
+    renderCodeTable(f);
+  };
+
+  $("genCodesBtn").onclick = function(){ $("genCodesCard").classList.toggle("hidden"); };
+
+  $("doGenBtn").onclick = async function(){
+    $("genMsg").textContent = "";
+    var count = Number($("genCount").value||0);
+    var days = Number($("genDays").value||0);
+    var len = 18;
+    try{
+      var d = await api("/api/admin/codes/generate", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ count: count, days: days, len: len }) });
+      $("genResult").value = (d.codes || []).join("\\n");
+      $("genMsg").textContent = "生成成功，可复制使用。";
+      await loadCodes();
+    }catch(e){
+      $("genMsg").textContent = "生成失败：" + e.message;
+    }
+  };
+
+  $("copyGenBtn").onclick = async function(){
+    var text = $("genResult").value || "";
+    if (!text) return alert("暂无可复制的卡密");
+    try{
+      await navigator.clipboard.writeText(text);
+      $("genMsg").textContent = "已复制全部卡密。";
+    }catch(e){
+      $("genMsg").textContent = "复制失败，请手动复制。";
+    }
+  };
+
+  async function revokeCode(code){
+    if(!confirm("确定作废该卡密？")) return;
+    try{
+      await api("/api/admin/codes/" + encodeURIComponent(code) + "/revoke", { method:"POST" });
+      await loadCodes();
+    }catch(e){
+      alert("作废失败：" + e.message);
+    }
+  }
+
+  async function deleteCode(code){
+    if(!confirm("确定删除该卡密？")) return;
+    try{
+      await api("/api/admin/codes/" + encodeURIComponent(code), { method:"DELETE" });
+      await loadCodes();
+    }catch(e){
+      alert("删除失败：" + e.message);
+    }
+  }
+
   // Chats
   var chatList = [];
   var chatMap = {};
@@ -1132,6 +1558,8 @@ export function adminHtml() {
   };
 
   // Broadcast
+  var autoRuleList = [];
+  var autoRuleActiveKey = null;
   var templateTitleMap = {};
   async function loadTemplateTitles(){
     try{
@@ -1153,8 +1581,6 @@ export function adminHtml() {
 
   async function loadBroadcastJobs(){
     try{
-      await loadTemplateTitles();
-      updateTemplateTitleDisplay($("bcTplKey").value.trim(), "bcTplTitle");
       var d = await api("/api/admin/broadcast/jobs");
       var rows = "";
       var items = d.items || [];
@@ -1192,6 +1618,149 @@ export function adminHtml() {
     }
   };
 
+  function renderAutoRuleTable(list){
+    var rows = "";
+    for (var i=0;i<list.length;i++){
+      var r = list[i];
+      rows += '<tr>';
+      rows += '<td><b>' + escapeHtml(r.kind_label) + '</b></td>';
+      rows += '<td>' + r.offset_days + ' 天</td>';
+      rows += '<td>' + escapeHtml(r.template_title || r.template_key || "") + '</td>';
+      rows += '<td>' + (r.is_enabled ? '<span class="pill">启用</span>' : '<span class="pill" style="background:#fee2e2;color:#991b1b">停用</span>') + '</td>';
+      rows += '<td class="col-actions"><button class="gray action-btn" data-rule="' + escapeHtml(r.rule_key) + '">编辑</button></td>';
+      rows += '</tr>';
+      if (autoRuleActiveKey === r.rule_key) {
+        rows += '<tr data-edit-row="' + escapeHtml(r.rule_key) + '">';
+        rows += '<td colspan="5">';
+        rows += '<div class="auto-rule-edit">';
+        rows += '<div class="auto-rule-field"><label>Rule Key</label><input data-field="rule_key" value="' + escapeHtml(r.rule_key) + '" disabled /></div>';
+        rows += '<div class="auto-rule-field"><label>类型</label><select data-field="kind">';
+        rows += '<option value="exp_before"' + (r.kind === "exp_before" ? " selected" : "") + '>到期前</option>';
+        rows += '<option value="exp_after"' + (r.kind === "exp_after" ? " selected" : "") + '>到期后</option>';
+        rows += '<option value="nonmember_monthly"' + (r.kind === "nonmember_monthly" ? " selected" : "") + '>到期提醒(当天)</option>';
+        rows += '</select></div>';
+        rows += '<div class="auto-rule-field"><label>触发天数</label><input data-field="offset_days" value="' + escapeHtml(String(r.offset_days)) + '" /></div>';
+        rows += '<div class="auto-rule-field"><label>模板 Key</label><input data-field="template_key" value="' + escapeHtml(r.template_key || "") + '" /></div>';
+        rows += '<div class="auto-rule-field"><label>标题</label><input data-field="template_title" value="' + escapeHtml(r.template_title || "") + '" disabled /></div>';
+        rows += '<div class="auto-rule-field"><label>状态</label><select data-field="is_enabled">';
+        rows += '<option value="1"' + (r.is_enabled ? " selected" : "") + '>启用</option>';
+        rows += '<option value="0"' + (!r.is_enabled ? " selected" : "") + '>停用</option>';
+        rows += '</select></div>';
+        rows += '<div class="auto-rule-actions">';
+        rows += '<button class="action-btn" data-action="save-rule" data-rule="' + escapeHtml(r.rule_key) + '">保存</button>';
+        rows += '<button class="gray action-btn" data-action="cancel-rule">取消</button>';
+        rows += '</div>';
+        rows += '</div>';
+        rows += '<div class="muted" data-msg="' + escapeHtml(r.rule_key) + '"></div>';
+        rows += '</td></tr>';
+      }
+    }
+    $("autoRuleTable").innerHTML = '<table class="table-edge center-2-4 auto-rule-table"><thead><tr><th>规则</th><th>触发</th><th>模版</th><th>状态</th><th class="col-actions">操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    var btns = $("autoRuleTable").querySelectorAll("button[data-rule]");
+    for (var j=0;j<btns.length;j++){
+      btns[j].onclick = function(){
+        var ruleKey = this.getAttribute("data-rule");
+        autoRuleActiveKey = (autoRuleActiveKey === ruleKey) ? null : ruleKey;
+        renderAutoRuleTable(autoRuleList);
+      };
+    }
+    var actionBtns = $("autoRuleTable").querySelectorAll("button[data-action]");
+    for (var k=0;k<actionBtns.length;k++){
+      actionBtns[k].onclick = handleAutoRuleAction;
+    }
+    var tplInputs = $("autoRuleTable").querySelectorAll('input[data-field="template_key"]');
+    for (var t=0;t<tplInputs.length;t++){
+      tplInputs[t].oninput = function(){
+        var key = this.value.trim();
+        var row = this.closest("tr");
+        if (!row) return;
+        var titleInput = row.querySelector('input[data-field="template_title"]');
+        if (titleInput) titleInput.value = templateTitleMap[key] || "";
+      };
+    }
+  }
+
+  async function loadAutoRules(){
+    try{
+      await loadTemplateTitles();
+      updateTemplateTitleDisplay($("bcTplKey").value.trim(), "bcTplTitle");
+      var d = await api("/api/admin/auto_rules");
+      autoRuleList = d.items || [];
+      renderAutoRuleTable(autoRuleList);
+    }catch(e){
+      $("autoRuleTable").textContent = "请先登录。";
+    }
+  }
+
+  async function handleAutoRuleAction(){
+    var action = this.getAttribute("data-action");
+    if (action === "cancel-rule") {
+      autoRuleActiveKey = null;
+      renderAutoRuleTable(autoRuleList);
+      return;
+    }
+    if (action !== "save-rule") return;
+    var ruleKey = this.getAttribute("data-rule");
+    var row = $("autoRuleTable").querySelector('tr[data-edit-row="' + ruleKey + '"]');
+    if (!row) return;
+    var body = {
+      kind: row.querySelector('[data-field="kind"]').value,
+      offset_days: Number(row.querySelector('[data-field="offset_days"]').value || 0),
+      template_key: row.querySelector('[data-field="template_key"]').value.trim(),
+      is_enabled: Number(row.querySelector('[data-field="is_enabled"]').value)
+    };
+    var msg = row.querySelector('[data-msg="' + ruleKey + '"]');
+    msg.textContent = "";
+    try{
+      await api("/api/admin/auto_rules/" + encodeURIComponent(ruleKey), { method:"PUT", headers:{ "content-type":"application/json" }, body: JSON.stringify(body) });
+      msg.textContent = "已保存";
+      await loadAutoRules();
+    }catch(e){
+      msg.textContent = "保存失败：" + e.message;
+    }
+  }
+
+  // Support
+  var supportPage = 1;
+  var supportQuery = "";
+  async function loadSupport(){
+    try{
+      var params = new URLSearchParams();
+      params.set("page", String(supportPage));
+      params.set("page_size", "10");
+      if (supportQuery) params.set("q", supportQuery);
+      var d = await api("/api/admin/support/sessions?" + params.toString());
+      var rows = "";
+      var items = d.items || [];
+      for (var i=0;i<items.length;i++){
+        var s = items[i];
+        var name = escapeHtml(s.display_name || "未知用户");
+        var link = s.profile_link ? '<a href="' + escapeHtml(s.profile_link) + '" target="_blank">' + name + '</a>' : name;
+        var dmLink = s.profile_link || ("tg://user?id=" + s.user_id);
+        rows += '<tr>';
+        rows += '<td>' + link + '</td>';
+        rows += '<td><b>' + s.user_id + '</b></td>';
+        rows += '<td>' + escapeHtml(s.updated_at) + '</td>';
+        rows += '<td>' + escapeHtml(s.status_label) + '</td>';
+        rows += '<td class="cell-actions col-actions"><a class="btn-link action-btn" href="' + escapeHtml(dmLink) + '" target="_blank">私信</a></td>';
+        rows += '</tr>';
+      }
+      $("supportList").innerHTML = '<table class="table-edge center-2-4 compact-table"><thead><tr><th>用户昵称</th><th>用户ID</th><th>更新时间</th><th>状态</th><th class="col-actions">操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      renderPagination("supportPagination", d.page || supportPage, d.total_pages || 1, function(p){
+        supportPage = p;
+        loadSupport();
+      });
+    }catch(e){
+      $("supportList").textContent = "请先登录。";
+    }
+  }
+
+  $("supportSearch").oninput = function(){
+    supportQuery = $("supportSearch").value.trim();
+    supportPage = 1;
+    loadSupport();
+  };
+
   (async function(){
     var userId = await whoami();
     var params = new URLSearchParams(location.search);
@@ -1206,6 +1775,66 @@ export function adminHtml() {
     }
     showView(h);
   })();
+
+  // Members
+  var memberPage = 1;
+  var memberQuery = "";
+  async function loadMembers(){
+    try{
+      var params = new URLSearchParams();
+      params.set("page", String(memberPage));
+      params.set("page_size", "10");
+      if (memberQuery) params.set("q", memberQuery);
+      var d = await api("/api/admin/memberships?" + params.toString());
+      var rows = "";
+      var items = d.items || [];
+      for (var i=0;i<items.length;i++){
+        var m = items[i];
+        var name = escapeHtml(m.display_name || "未知用户");
+        var link = m.profile_link ? '<a href="' + escapeHtml(m.profile_link) + '" target="_blank">' + name + '</a>' : name;
+        rows += '<tr>';
+        rows += '<td>' + link + '</td>';
+        rows += '<td><b>' + m.user_id + '</b></td>';
+        rows += '<td>' + escapeHtml(m.verified_at || "") + '</td>';
+        rows += '<td>' + escapeHtml(m.days_left_label || "") + '</td>';
+        rows += '<td class="cell-actions col-actions"><button class="gray action-btn" data-member="' + m.user_id + '">调整期限</button></td>';
+        rows += '</tr>';
+      }
+      $("memberTable").innerHTML = '<table class="table-edge center-2-4 compact-table"><thead><tr><th>用户昵称</th><th>用户ID</th><th>成为会员</th><th>会员余期</th><th class="col-actions">操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      var btns = $("memberTable").querySelectorAll("button[data-member]");
+      for (var j=0;j<btns.length;j++){
+        btns[j].onclick = async function(){
+          var userId = this.getAttribute("data-member");
+          var val = prompt("请输入新的会员剩余天数（整数）", "30");
+          if (val === null) return;
+          var daysLeft = Number(val);
+          if (!Number.isFinite(daysLeft)) return alert("请输入有效天数");
+          try{
+            await api("/api/admin/memberships/" + encodeURIComponent(userId), {
+              method:"PUT",
+              headers:{ "content-type":"application/json" },
+              body: JSON.stringify({ days_left: daysLeft })
+            });
+            loadMembers();
+          }catch(e){
+            alert("修改失败：" + e.message);
+          }
+        };
+      }
+      renderPagination("memberPagination", d.page || memberPage, d.total_pages || 1, function(p){
+        memberPage = p;
+        loadMembers();
+      });
+    }catch(e){
+      $("memberTable").textContent = "请先登录。";
+    }
+  }
+
+  $("memberSearch").oninput = function(){
+    memberQuery = $("memberSearch").value.trim();
+    memberPage = 1;
+    loadMembers();
+  };
 
   // Users
   var userPage = 1;
@@ -1368,32 +1997,40 @@ export async function adminApi(env, req, pathname) {
     const tomorrowStart = todayStart + 86400;
     const weekStart = getTzWeekStart(now, tz);
     const nextWeekStart = weekStart + 7 * 86400;
+    const lastWeekStart = weekStart - 7 * 86400;
+
+    const total_users = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users`).first()).c;
+    const members = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE expire_at > ?`).bind(now).first()).c;
+    const expiring_7d = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE expire_at BETWEEN ? AND ?`).bind(now, now + 7 * 86400).first()).c;
+    const expired = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE expire_at <= ?`).bind(now).first()).c;
+    const week_follow = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
+    const week_unsub = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE can_dm=0 AND last_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
+    const last_week_follow = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(lastWeekStart, weekStart).first()).c;
+    const last_week_unsub = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE can_dm=0 AND last_seen_at BETWEEN ? AND ?`).bind(lastWeekStart, weekStart).first()).c;
     const tzParts = getTzParts(new Date(now * 1000), tz);
     const monthStart = todayStart - (tzParts.day - 1) * 86400;
+    const month_follow = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(monthStart, tomorrowStart).first()).c;
     const weekSeriesStart = todayStart - 6 * 86400;
+    const weekRows = await getDb(env).prepare(
+      `SELECT first_seen_at FROM users WHERE first_seen_at BETWEEN ? AND ?`
+    ).bind(weekSeriesStart, tomorrowStart - 1).all();
+    const weekBuckets = {};
+    for (const row of (weekRows.results || [])) {
+      const key = getTzDateKey(row.first_seen_at, tz);
+      weekBuckets[key] = (weekBuckets[key] || 0) + 1;
+    }
+    const weekly_follow_series = [];
+    for (let i = 0; i < 7; i++) {
+      const dayStart = weekSeriesStart + i * 86400;
+      const key = getTzDateKey(dayStart, tz);
+      const labelParts = key.split("-");
+      const label = `${labelParts[1]}-${labelParts[2]}`;
+      weekly_follow_series.push({ date: label, count: weekBuckets[key] || 0 });
+    }
     const kv = getKv(env);
     let week_images = 0;
     let month_images = 0;
-    let week_image_users = 0;
-    let month_image_users = 0;
     const weekly_image_series = [];
-    const weekly_user_member_series = [];
-    const userRows = await getDb(env).prepare(
-      `SELECT first_seen_at FROM users WHERE first_seen_at BETWEEN ? AND ?`
-    ).bind(weekSeriesStart, tomorrowStart - 1).all();
-    const memberRows = await getDb(env).prepare(
-      `SELECT first_seen_at FROM vip_members WHERE first_seen_at BETWEEN ? AND ?`
-    ).bind(weekSeriesStart, tomorrowStart - 1).all();
-    const weekUserBuckets = {};
-    const weekMemberBuckets = {};
-    for (const row of (userRows.results || [])) {
-      const key = getTzDateKey(row.first_seen_at, tz);
-      weekUserBuckets[key] = (weekUserBuckets[key] || 0) + 1;
-    }
-    for (const row of (memberRows.results || [])) {
-      const key = getTzDateKey(row.first_seen_at, tz);
-      weekMemberBuckets[key] = (weekMemberBuckets[key] || 0) + 1;
-    }
     for (let i = 0; i < 7; i++) {
       const dayStart = weekSeriesStart + i * 86400;
       const key = getTzDateKey(dayStart, tz);
@@ -1402,39 +2039,31 @@ export async function adminApi(env, req, pathname) {
       const labelParts = key.split("-");
       const label = `${labelParts[1]}-${labelParts[2]}`;
       weekly_image_series.push({ date: label, count: dayTotal, users: dayUsers });
-      weekly_user_member_series.push({
-        date: label,
-        count: weekUserBuckets[key] || 0,
-        users: weekMemberBuckets[key] || 0
-      });
     }
     const weekDays = Math.max(0, Math.floor((tomorrowStart - weekStart) / 86400));
     for (let i = 0; i < weekDays; i++) {
       const key = getTzDateKey(weekStart + i * 86400, tz);
       week_images += Number(await kv.get(`image_total:${key}`) || 0);
-      week_image_users += Number(await kv.get(`image_user_total:${key}`) || 0);
     }
     const monthDays = Math.max(0, Math.floor((tomorrowStart - monthStart) / 86400));
     for (let i = 0; i < monthDays; i++) {
       const key = getTzDateKey(monthStart + i * 86400, tz);
       month_images += Number(await kv.get(`image_total:${key}`) || 0);
-      month_image_users += Number(await kv.get(`image_user_total:${key}`) || 0);
     }
-    const week_new_users = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
-    const month_new_users = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(monthStart, tomorrowStart).first()).c;
-    const week_new_members = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM vip_members WHERE first_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
-    const month_new_members = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM vip_members WHERE first_seen_at BETWEEN ? AND ?`).bind(monthStart, tomorrowStart).first()).c;
     return new Response(JSON.stringify({
       ok:true,
-      week_new_users,
-      month_new_users,
-      week_image_users,
-      month_image_users,
-      week_new_members,
-      month_new_members,
+      total_users,
+      members,
+      expiring_7d,
+      expired,
+      week_follow,
+      week_unsub,
+      last_week_follow,
+      last_week_unsub,
+      month_follow,
       week_images,
       month_images,
-      weekly_user_member_series,
+      weekly_follow_series,
       weekly_image_series
     }), { headers: JSON_HEADERS });
   }
@@ -1460,7 +2089,7 @@ export async function adminApi(env, req, pathname) {
     }
     await tgCall(env, "setWebhook", {
       url,
-      allowed_updates: ["message", "callback_query"],
+      allowed_updates: ["message", "callback_query", "chat_join_request", "chat_member", "my_chat_member"],
     });
     return new Response(JSON.stringify({ ok:true, url }), { headers: JSON_HEADERS });
   }
@@ -1471,6 +2100,7 @@ export async function adminApi(env, req, pathname) {
     const rows = await getDb(env).prepare(
       `SELECT key,title,text,buttons_json,updated_at
        FROM templates
+       WHERE key != 'join_denied'
        ORDER BY CASE key ${orderCase} ELSE 999 END, key`
     ).all();
     const items = (rows.results || []).map(r => ({
@@ -1479,7 +2109,7 @@ export async function adminApi(env, req, pathname) {
       text: r.text,
       btn_rows: (JSON.parse(r.buttons_json||"[]")||[]).length,
       updated_at: fmtDateTime(r.updated_at, env.TZ),
-      is_system: ["start","image_limit_nonmember","image_limit_member","image_reply"].includes(r.key)
+      is_system: ["start","ask_code","vip_new","vip_renew","support_open","support_closed","support_closed_spam","image_limit","image_limit_nonmember","image_limit_member"].includes(r.key)
     }));
     return new Response(JSON.stringify({ ok:true, items }), { headers: JSON_HEADERS });
   }
@@ -1543,6 +2173,53 @@ export async function adminApi(env, req, pathname) {
     return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
+  // Codes
+  if (pathname === "/api/admin/codes" && req.method === "GET") {
+    const rows = await getDb(env).prepare(`SELECT code,days,status,used_by,used_at FROM codes ORDER BY created_at DESC LIMIT 500`).all();
+    const items = (rows.results || []).map(r => ({
+      code: r.code,
+      days: r.days,
+      status: r.status,
+      used_by: r.used_by,
+      used_at: r.used_at ? fmtDateTime(r.used_at, env.TZ) : ""
+    }));
+    return new Response(JSON.stringify({ ok:true, items }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname === "/api/admin/codes/generate" && req.method === "POST") {
+    const body = await req.json();
+    const count = Math.max(1, Math.min(500, Number(body.count || 1)));
+    const days = Math.max(1, Math.min(36500, Number(body.days || 365)));
+    const len = 18;
+    const bound_chat_id = null;
+    const codes = [];
+    const t = nowSec();
+
+    // Generate unique codes (best-effort)
+    for (let i=0; i<count; i++) {
+      let code = randCode(len);
+      // ensure not exists
+      const exists = await getDb(env).prepare(`SELECT code FROM codes WHERE code=?`).bind(code).first();
+      if (exists) { i--; continue; }
+      await getDb(env).prepare(`INSERT INTO codes(code,days,status,created_at,created_by,bound_chat_id) VALUES (?,?,?,?,?,?)`)
+        .bind(code, days, "unused", t, userId, bound_chat_id).run();
+      codes.push(code);
+    }
+    return new Response(JSON.stringify({ ok:true, codes }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname.startsWith("/api/admin/codes/") && pathname.endsWith("/revoke") && req.method === "POST") {
+    const code = decodeURIComponent(pathname.split("/")[4]);
+    await getDb(env).prepare(`UPDATE codes SET status='revoked' WHERE code=? AND status!='used'`).bind(code).run();
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname.startsWith("/api/admin/codes/") && req.method === "DELETE") {
+    const code = decodeURIComponent(pathname.split("/").pop());
+    await getDb(env).prepare(`DELETE FROM codes WHERE code=?`).bind(code).run();
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
+  }
+
   // Chats
   if (pathname === "/api/admin/chats" && req.method === "GET") {
     const rows = await getDb(env).prepare(`SELECT chat_id,chat_type,title,is_enabled,created_at FROM managed_chats ORDER BY created_at DESC`).all();
@@ -1595,7 +2272,7 @@ export async function adminApi(env, req, pathname) {
   // Broadcast jobs
   if (pathname === "/api/admin/broadcast/create" && req.method === "POST") {
     const body = await req.json();
-    const audience = "all";
+    const audience = ["all","member","nonmember"].includes(body.audience) ? body.audience : "all";
     const template_key = String(body.template_key || "").trim();
     const tpl = await getDb(env).prepare(`SELECT key FROM templates WHERE key=?`).bind(template_key).first();
     if (!tpl) return new Response(JSON.stringify({ ok:false, error:"模板不存在" }), { status: 400, headers: JSON_HEADERS });
@@ -1603,7 +2280,11 @@ export async function adminApi(env, req, pathname) {
     const job_id = crypto.randomUUID();
     const t = nowSec();
     // Estimate audience size
-    const total = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE can_dm=1`).first()).c;
+    let q = `SELECT COUNT(*) AS c FROM users WHERE can_dm=1`;
+    let bind = [];
+    if (audience === "member") { q = `SELECT COUNT(*) AS c FROM memberships m JOIN users u ON u.user_id=m.user_id WHERE u.can_dm=1 AND m.expire_at > ?`; bind=[nowSec()]; }
+    if (audience === "nonmember") { q = `SELECT COUNT(*) AS c FROM users u LEFT JOIN memberships m ON m.user_id=u.user_id WHERE u.can_dm=1 AND (m.user_id IS NULL OR m.expire_at <= ?)`; bind=[nowSec()]; }
+    const total = (await getDb(env).prepare(q).bind(...bind).first()).c;
 
     await getDb(env).prepare(`INSERT INTO broadcast_jobs(job_id,audience,template_key,created_at,status,total) VALUES (?,?,?,?,?,?)`)
       .bind(job_id, audience, template_key, t, "pending", total).run();
@@ -1623,6 +2304,126 @@ export async function adminApi(env, req, pathname) {
       fail: r.fail
     }));
     return new Response(JSON.stringify({ ok:true, items }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname === "/api/admin/auto_rules" && req.method === "GET") {
+    const rows = await getDb(env).prepare(
+      `SELECT r.rule_key,r.kind,r.offset_days,r.template_key,r.is_enabled,t.title AS template_title
+       FROM auto_rules r
+       LEFT JOIN templates t ON t.key=r.template_key
+       ORDER BY CASE
+         WHEN r.kind='exp_before' AND r.offset_days=30 THEN 1
+         WHEN r.kind='exp_before' AND r.offset_days=15 THEN 2
+         WHEN r.kind='exp_before' AND r.offset_days=7 THEN 3
+         WHEN r.kind='exp_before' AND r.offset_days=3 THEN 4
+         WHEN r.kind='exp_before' AND r.offset_days=1 THEN 5
+         WHEN r.kind='nonmember_monthly' THEN 6
+         WHEN r.kind='exp_after' AND r.offset_days=1 THEN 7
+         WHEN r.kind='exp_after' AND r.offset_days=3 THEN 8
+         WHEN r.kind='exp_after' AND r.offset_days=7 THEN 9
+         WHEN r.kind='exp_after' AND r.offset_days=15 THEN 10
+         WHEN r.kind='exp_after' AND r.offset_days=30 THEN 11
+         ELSE 999
+       END, r.rule_key`
+    ).all();
+    const kindLabel = {
+      exp_before: "到期前提醒",
+      exp_after: "到期后提醒",
+      nonmember_monthly: "到期提醒(当天)"
+    };
+    const items = (rows.results || []).map(r => ({
+      rule_key: r.rule_key,
+      kind: r.kind,
+      kind_label: kindLabel[r.kind] || r.kind,
+      offset_days: r.offset_days,
+      template_key: r.template_key,
+      template_title: r.template_title || "",
+      is_enabled: r.is_enabled === 1
+    }));
+    return new Response(JSON.stringify({ ok:true, items }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname.startsWith("/api/admin/auto_rules/") && req.method === "PUT") {
+    const rule_key = decodeURIComponent(pathname.split("/").pop());
+    const body = await req.json();
+    const kind = ["exp_before","exp_after","nonmember_monthly"].includes(body.kind) ? body.kind : "exp_before";
+    const offset_days = Math.max(0, Math.min(3650, Number(body.offset_days || 0)));
+    const template_key = String(body.template_key || "").trim();
+    if (!template_key) return new Response(JSON.stringify({ ok:false, error:"模板Key不能为空" }), { status: 400, headers: JSON_HEADERS });
+    const tpl = await getDb(env).prepare(`SELECT key FROM templates WHERE key=?`).bind(template_key).first();
+    if (!tpl) return new Response(JSON.stringify({ ok:false, error:"模板不存在" }), { status: 400, headers: JSON_HEADERS });
+    await getDb(env).prepare(
+      `INSERT INTO auto_rules(rule_key,kind,offset_days,template_key,is_enabled)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT(rule_key) DO UPDATE SET kind=excluded.kind, offset_days=excluded.offset_days, template_key=excluded.template_key, is_enabled=excluded.is_enabled`
+    ).bind(rule_key, kind, offset_days, template_key, Number(body.is_enabled || 0) ? 1 : 0).run();
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
+  }
+
+  // Memberships
+  if (pathname === "/api/admin/memberships" && req.method === "GET") {
+    const q = (url.searchParams.get("q") || "").trim();
+    const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+    const pageSize = Math.min(50, Math.max(1, Number(url.searchParams.get("page_size") || 10)));
+    const offset = (page - 1) * pageSize;
+    let where = "";
+    let bind = [];
+    if (q) {
+      const like = `%${q}%`;
+      where = "WHERE CAST(u.user_id AS TEXT) LIKE ? OR u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?";
+      bind = [like, like, like, like];
+    }
+    const countRow = await getDb(env).prepare(
+      `SELECT COUNT(*) AS c
+       FROM memberships m
+       JOIN users u ON u.user_id=m.user_id
+       ${where}`
+    ).bind(...bind).first();
+    const total = countRow?.c || 0;
+    const rows = await getDb(env).prepare(
+      `SELECT m.user_id,m.verified_at,m.expire_at,u.username,u.first_name,u.last_name
+       FROM memberships m
+       JOIN users u ON u.user_id=m.user_id
+       ${where}
+       ORDER BY m.expire_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...bind, pageSize, offset).all();
+    const now = nowSec();
+    const items = (rows.results || []).map(r => {
+      const display = buildUserDisplay(r);
+      const daysLeft = Math.max(0, Math.ceil((r.expire_at - now) / 86400));
+      return {
+        user_id: r.user_id,
+        verified_at: fmtDateTime(r.verified_at, env.TZ),
+        days_left: daysLeft,
+        days_left_label: `${daysLeft} 天`,
+        display_name: display.displayName,
+        profile_link: display.profileLink
+      };
+    });
+    return new Response(JSON.stringify({
+      ok:true,
+      items,
+      page,
+      total,
+      total_pages: Math.max(1, Math.ceil(total / pageSize))
+    }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname.startsWith("/api/admin/memberships/") && req.method === "PUT") {
+    const targetId = Number(decodeURIComponent(pathname.split("/").pop()));
+    if (!Number.isFinite(targetId)) return new Response(JSON.stringify({ ok:false, error:"用户ID无效" }), { status: 400, headers: JSON_HEADERS });
+    const body = await req.json();
+    const daysLeft = Number(body.days_left || 0);
+    if (!Number.isFinite(daysLeft)) return new Response(JSON.stringify({ ok:false, error:"天数无效" }), { status: 400, headers: JSON_HEADERS });
+    const t = nowSec();
+    const expireAt = t + Math.max(0, Math.floor(daysLeft)) * 86400;
+    await getDb(env).prepare(
+      `INSERT INTO memberships(user_id,verified_at,expire_at,updated_at)
+       VALUES (?,?,?,?)
+       ON CONFLICT(user_id) DO UPDATE SET expire_at=excluded.expire_at, updated_at=excluded.updated_at`
+    ).bind(targetId, t, expireAt, t).run();
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
   // Users
@@ -1681,66 +2482,419 @@ export async function adminApi(env, req, pathname) {
     return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
+  // Support sessions
+  if (pathname === "/api/admin/support/sessions" && req.method === "GET") {
+    const q = (url.searchParams.get("q") || "").trim();
+    const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+    const pageSize = Math.min(50, Math.max(1, Number(url.searchParams.get("page_size") || 10)));
+    const offset = (page - 1) * pageSize;
+    let where = "";
+    let bind = [];
+    if (q) {
+      const like = `%${q}%`;
+      where = "WHERE CAST(u.user_id AS TEXT) LIKE ? OR u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?";
+      bind = [like, like, like, like];
+    }
+    const countRow = await getDb(env).prepare(
+      `SELECT COUNT(*) AS c
+       FROM support_sessions s
+       JOIN users u ON u.user_id=s.user_id
+       ${where}`
+    ).bind(...bind).first();
+    const total = countRow?.c || 0;
+    const rows = await getDb(env).prepare(
+      `SELECT s.user_id,s.is_open,s.updated_at,u.username,u.first_name,u.last_name,u.support_blocked
+       FROM support_sessions s
+       JOIN users u ON u.user_id=s.user_id
+       ${where}
+       ORDER BY s.updated_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...bind, pageSize, offset).all();
+    const items = [];
+    for (const r of (rows.results || [])) {
+      let isOpen = r.is_open === 1;
+      if (isOpen) {
+        const kvVal = await getKv(env).get(`support_open:${r.user_id}`);
+        if (!kvVal) {
+          await closeSupport(env, r.user_id);
+          isOpen = false;
+        }
+      }
+      const display = buildUserDisplay(r);
+      const statusLabel = r.support_blocked === 1 ? "拉黑" : (isOpen ? "开启" : "关闭");
+      items.push({
+        user_id: r.user_id,
+        is_open: isOpen,
+        status_label: statusLabel,
+        display_name: display.displayName,
+        profile_link: display.profileLink,
+        updated_at: fmtDateTime(r.updated_at, env.TZ)
+      });
+    }
+    return new Response(JSON.stringify({
+      ok:true,
+      items,
+      page,
+      total,
+      total_pages: Math.max(1, Math.ceil(total / pageSize))
+    }), { headers: JSON_HEADERS });
+  }
+
   return new Response(JSON.stringify({ ok:false, error:"Not Found" }), { status: 404, headers: JSON_HEADERS });
 }
 
 export async function handleWebhook(env, update, requestUrl) {
   const requestUrlString = String(requestUrl || "");
   const baseOrigin = requestUrlString ? new URL(requestUrlString).origin : "";
+  // Track users who DM the bot
   const msg = update.message;
   const cbq = update.callback_query;
+  const joinReq = update.chat_join_request;
+  const chatMember = update.chat_member;
+  const myChatMember = update.my_chat_member;
 
   if (msg && msg.from?.id) await ensureUser(env, msg.from);
 
-  if (cbq) {
-    const userId = cbq.from?.id;
-    const chatId = cbq.message?.chat?.id;
-    const data = cbq.data || "";
-    try { await tgCall(env, "answerCallbackQuery", { callback_query_id: cbq.id }); } catch {}
-    if (!isPrivateChat(cbq.message)) return;
-    if (data === "/start" || data === "START") {
-      await ensureBotCommands(env);
-      const tpl = await getTemplate(env, "start");
-      const startButtons = tpl?.buttons?.length ? tpl.buttons : START_DEFAULT_BUTTONS;
-      await trySendMessage(env, userId, {
-        chat_id: userId,
-        text: normalizeTelegramHtml(tpl?.text || START_DEFAULT_TEXT),
-        parse_mode: tpl?.parse_mode || "HTML",
-        disable_web_page_preview: tpl ? tpl.disable_preview : false,
-        reply_markup: startButtons.length ? buildKeyboard(startButtons) : undefined,
-      });
+  if (myChatMember) {
+    const chat = myChatMember.chat;
+    const newStatus = myChatMember.new_chat_member?.status;
+    const inviterId = myChatMember.from?.id;
+    const adminIds = parseAdminIds(env);
+    const botAdded = ["member", "administrator"].includes(newStatus);
+    if (botAdded && chat?.id && !adminIds.includes(inviterId)) {
+      try {
+        await tgCall(env, "leaveChat", { chat_id: chat.id });
+      } catch {
+        // ignore
+      }
+      return;
+    }
+  }
+
+  if (msg?.new_chat_members?.length) {
+    const botInfo = msg.new_chat_members.find(member => member?.is_bot);
+    if (botInfo && msg.chat?.id) {
+      const adminIds = parseAdminIds(env);
+      const inviterId = msg.from?.id;
+      if (!adminIds.includes(inviterId)) {
+        try {
+          await tgCall(env, "leaveChat", { chat_id: msg.chat.id });
+        } catch {
+          // ignore
+        }
+        return;
+      }
+    }
+  }
+
+    // Enforce membership on chat member changes (new joins after bot added)
+  if (chatMember) {
+    const chatId = chatMember.chat?.id;
+    const memberUser = chatMember.new_chat_member?.user;
+    const status = chatMember.new_chat_member?.status;
+    if (chatId && memberUser && !memberUser.is_bot) {
+      const managed = await getDb(env).prepare(`SELECT chat_id FROM managed_chats WHERE chat_id=? AND is_enabled=1`).bind(chatId).first();
+      if (managed && (status === "member" || status === "restricted")) {
+        const memberOk = await isMember(env, memberUser.id);
+        if (!memberOk) {
+          const t = nowSec();
+          try {
+            await tgCall(env, "banChatMember", { chat_id: chatId, user_id: memberUser.id, until_date: t + 30 });
+            await tgCall(env, "unbanChatMember", { chat_id: chatId, user_id: memberUser.id, only_if_banned: true });
+            await getDb(env).prepare(`UPDATE user_chats SET removed_at=? WHERE user_id=? AND chat_id=?`).bind(t, memberUser.id, chatId).run();
+          } catch {
+            // ignore permission errors
+          }
+        }
+      }
+    }
+  }
+
+  // Join request handling (for managed chats only)
+  if (joinReq) {
+    const chatId = joinReq.chat?.id;
+    const userId = joinReq.from?.id;
+    const managed = await getDb(env).prepare(`SELECT chat_id,title FROM managed_chats WHERE chat_id=? AND is_enabled=1`).bind(chatId).first();
+    if (!managed) return;
+    const inviteName = joinReq.invite_link?.name || "";
+    const inviteLink = joinReq.invite_link?.invite_link || "";
+    await getDb(env).prepare(
+      `INSERT INTO join_request_logs(user_id,chat_id,invite_name,invite_link,requested_at)
+       VALUES (?,?,?,?,?)`
+    ).bind(userId, chatId, inviteName, inviteLink, nowSec()).run();
+
+    let vipInvite;
+    try {
+      vipInvite = await ensureVipInviteLink(env, chatId, managed.title || joinReq.chat?.title || "");
+    } catch {
+      vipInvite = null;
+    }
+    const linkMatches = inviteLink && vipInvite?.invite_link && inviteLink === vipInvite.invite_link;
+    const nameMatches = !inviteLink && inviteName && vipInvite?.name && inviteName === vipInvite.name;
+    if (!linkMatches && !nameMatches) {
+      await tgCall(env, "declineChatJoinRequest", { chat_id: chatId, user_id: userId });
+      return;
+    }
+
+    const memberOk = await isMember(env, userId);
+    if (memberOk) {
+      await tgCall(env, "approveChatJoinRequest", { chat_id: chatId, user_id: userId });
+      await getDb(env).prepare(
+        `INSERT INTO user_chats(user_id,chat_id,approved_at,removed_at) VALUES (?,?,?,NULL)
+         ON CONFLICT(user_id,chat_id) DO UPDATE SET approved_at=excluded.approved_at, removed_at=NULL`
+      ).bind(userId, chatId, nowSec()).run();
+    } else {
+      await tgCall(env, "declineChatJoinRequest", { chat_id: chatId, user_id: userId });
+      // If we can DM, send "denied" template
+      const u = await getDb(env).prepare(`SELECT can_dm FROM users WHERE user_id=?`).bind(userId).first();
+      if (u && u.can_dm === 1) {
+        try {
+          const tpl = await getTemplate(env, "join_denied");
+          if (tpl) {
+            await sendTemplate(env, userId, "join_denied");
+          } else {
+            await tgCall(env, "sendMessage", { chat_id: userId, text: "您当前不是VIP用户或会员已到期，请发送卡密验证。" });
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
     }
     return;
   }
 
+  // Callback query buttons
+  if (cbq) {
+    const userId = cbq.from?.id;
+    const chatId = cbq.message?.chat?.id;
+    const data = cbq.data || "";
+
+    // Always answer callback to avoid "loading"
+    try { await tgCall(env, "answerCallbackQuery", { callback_query_id: cbq.id }); } catch {}
+
+    if (!isPrivateChat(cbq.message)) return;
+
+    if (data === "VERIFY") {
+      try {
+        const tpl = await getTemplate(env, "ask_code");
+        if (tpl) {
+          await sendTemplate(env, chatId, "ask_code");
+        } else {
+          await tgCall(env, "sendMessage", { chat_id: chatId, text: "请发送卡密给机器人：" });
+        }
+      } catch {
+        await tgCall(env, "sendMessage", { chat_id: chatId, text: "请发送卡密给机器人：" });
+      }
+      return;
+    }
+    if (data === "/start" || data === "START") {
+      await ensureBotCommands(env);
+      const tpl = await getTemplate(env, "start");
+      if (!tpl) throw new Error("Missing template: start");
+      const buttons = appendFixedStartButtons(tpl.buttons);
+      await trySendMessage(env, userId, {
+        chat_id: userId,
+        text: normalizeTelegramHtml(tpl.text),
+        parse_mode: tpl.parse_mode,
+        disable_web_page_preview: tpl.disable_preview,
+        reply_markup: buildKeyboard(buttons),
+      });
+      return;
+    }
+    if (data === "SUPPORT") {
+      if (await isSupportBlocked(env, userId)) {
+        await tgCall(env, "sendMessage", { chat_id: chatId, text: "你已被管理员屏蔽使用人工客服，请稍后再试。" });
+        return;
+      }
+      if (await isSupportTempBanned(env, userId)) {
+        const spamTpl = await getTemplate(env, "support_closed_spam");
+        if (spamTpl) {
+          await sendTemplate(env, chatId, "support_closed_spam");
+        } else {
+          await tgCall(env, "sendMessage", { chat_id: chatId, text: "消息发送失败，请于1小时后再来尝试。" });
+        }
+        return;
+      }
+      if (await isSupportOpen(env, userId)) {
+        await closeSupport(env, userId);
+        await sendSupportClosedNotice(env, chatId);
+        return;
+      }
+      await openSupport(env, userId);
+      await sendTemplate(env, chatId, "support_open");
+      return;
+    }
+    return;
+  }
+
+  // Messages
   if (!msg) return;
   if (!isPrivateChat(msg)) return;
-  const userId = msg.from?.id;
-  if (!Number.isFinite(userId)) return;
-  const text = msg.text || msg.caption || "";
 
+  const userId = msg.from?.id;
+  const text = msg.text || msg.caption || "";
+  const t = nowSec();
+  const adminIds = parseAdminIds(env);
+  const isAdmin = adminIds.includes(userId);
+  const repliedUserId = isAdmin ? await resolveSupportUserId(env, msg) : null;
+
+  // Admin commands in private chat
   if (text.startsWith("/login")) {
     await handleAdminLoginCommand(env, msg, baseOrigin);
     return;
   }
 
+  // Admin reply command: /reply <user_id> <text>
+  if (isAdmin && text.startsWith("/reply")) {
+    const m = text.match(/^\/reply\s+(\d+)\s+([\s\S]+)$/);
+    if (m) {
+      const target = Number(m[1]);
+      const body = m[2];
+      try {
+        await trySendMessage(env, target, { chat_id: target, text: body });
+      } catch (e) {
+        await tgCall(env, "sendMessage", { chat_id: userId, text: "发送失败：" + (e.tg?.description || e.message) });
+      }
+    } else {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "用法：/reply 用户ID 内容" });
+    }
+    return;
+  }
+
+  // Admin support block commands: /block <user_id> or /unblock <user_id>
+  if (isAdmin && (text.startsWith("/block") || text.startsWith("/support_block"))) {
+    const m = text.match(/^\/(?:block|support_block)\s+(\d+)$/);
+    if (!m) {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "用法：/block 用户ID" });
+      return;
+    }
+    const target = Number(m[1]);
+    await setSupportBlocked(env, target, true);
+    await tgCall(env, "sendMessage", { chat_id: userId, text: "已屏蔽该用户使用人工客服。" });
+    return;
+  }
+  if (isAdmin && (text.startsWith("/unblock") || text.startsWith("/support_unblock"))) {
+    const m = text.match(/^\/(?:unblock|support_unblock)\s+(\d+)$/);
+    if (!m) {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "用法：/unblock 用户ID" });
+      return;
+    }
+    const target = Number(m[1]);
+    await setSupportBlocked(env, target, false);
+    await tgCall(env, "sendMessage", { chat_id: userId, text: "已解除该用户客服屏蔽。" });
+    return;
+  }
+
+  if (isAdmin && repliedUserId) {
+    const trimmed = text.trim();
+    if (trimmed === "/id") {
+      const [profile, vip] = await Promise.all([
+        getSupportUserProfile(env, repliedUserId),
+        isMember(env, repliedUserId),
+      ]);
+      const infoText = buildSupportUserInfoText(profile, vip, repliedUserId);
+      await tgCall(env, "sendMessage", {
+        chat_id: userId,
+        text: infoText,
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    if (trimmed && !trimmed.startsWith("/")) {
+      try {
+        await trySendMessage(env, repliedUserId, { chat_id: repliedUserId, text: text });
+      } catch (e) {
+        await tgCall(env, "sendMessage", { chat_id: userId, text: "发送失败：" + (e.tg?.description || e.message) });
+      }
+      return;
+    }
+  }
+
+  // Support session forwarding (higher priority than other replies)
+  const supportOpen = await isSupportOpen(env, userId);
+  if (supportOpen) {
+    if (await isSupportBlocked(env, userId)) {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "你已被管理员屏蔽使用人工客服。" });
+      return;
+    }
+    if (await isSupportTempBanned(env, userId)) {
+      const spamTpl = await getTemplate(env, "support_closed_spam");
+      if (spamTpl) {
+        await sendTemplate(env, userId, "support_closed_spam");
+      } else {
+        await tgCall(env, "sendMessage", { chat_id: userId, text: "消息发送失败，请于1小时后再来尝试。" });
+      }
+      return;
+    }
+    const spam = await checkSpamAndMaybeClose(env, userId);
+    if (spam.closedNow) {
+      await sendTemplate(env, userId, "support_closed_spam");
+      return;
+    }
+    if (spam.muted) return;
+
+    const trimmed = text.trim();
+    const code = extractCardCode(text);
+    const isCardCode = code && isLikelyCardCode(code);
+    const isCommand = trimmed.startsWith("/");
+
+    if (isCardCode) {
+      await handleCardRedeem(env, userId, code);
+      return;
+    }
+
+    if (isCommand) {
+      // Let commands continue to normal handling without forwarding.
+    } else {
+      if (msg.media_group_id) {
+        await bufferSupportMediaGroup(env, msg);
+      } else {
+        const adminIds2 = parseAdminIds(env);
+        for (const adminId of adminIds2) {
+          const forwarded = await tgCall(env, "forwardMessage", {
+            chat_id: adminId,
+            from_chat_id: userId,
+            message_id: msg.message_id
+          });
+          await storeSupportForwardMap(env, adminId, forwarded?.message_id, userId);
+        }
+      }
+      if (!msg.media_group_id || await shouldNotifySupportMediaGroup(env, msg.media_group_id)) {
+        await trySendMessage(env, userId, { chat_id: userId, text: "消息已发送给客服，请耐心等待回复。" });
+      }
+      return;
+    }
+  }
+
   if (text.startsWith("/start")) {
     await ensureBotCommands(env);
     const tpl = await getTemplate(env, "start");
-    const startButtons = tpl?.buttons?.length ? tpl.buttons : START_DEFAULT_BUTTONS;
+    if (!tpl) throw new Error("Missing template: start");
+    const buttons = appendFixedStartButtons(tpl.buttons);
     await trySendMessage(env, userId, {
       chat_id: userId,
-      text: normalizeTelegramHtml(tpl?.text || START_DEFAULT_TEXT),
-      parse_mode: tpl?.parse_mode || "HTML",
-      disable_web_page_preview: tpl ? tpl.disable_preview : false,
-      reply_markup: startButtons.length ? buildKeyboard(startButtons) : undefined,
+      text: normalizeTelegramHtml(tpl.text),
+      parse_mode: tpl.parse_mode,
+      disable_web_page_preview: tpl.disable_preview,
+      reply_markup: buildKeyboard(buttons),
     });
     return;
   }
 
-  const member = await isMember(env, userId);
-  if (member) {
-    await recordVipMember(env, userId);
+  if (msg.media_group_id) {
+    if (await shouldNotifyMediaGroup(env, userId, msg.media_group_id)) {
+      await recordDailyImageReminder(env, userId);
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "请发送一张图片进行搜索哦～" });
+    }
+    return;
+  }
+
+  if (isVideoMessage(msg)) {
+    if (await shouldNotifyVideoWarning(env, userId)) {
+      await recordDailyImageReminder(env, userId);
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "本机器人只支持图片搜索哦～" });
+    }
+    return;
   }
 
   const imageInfo = getMessageImageInfo(msg);
@@ -1750,23 +2904,19 @@ export async function handleWebhook(env, update, requestUrl) {
       const tierKey = limitCheck.member ? "member" : "nonmember";
       if (await shouldNotifyImageLimit(env, userId, tierKey)) {
         const templateKey = limitCheck.member ? IMAGE_LIMIT_MEMBER_TEMPLATE_KEY : IMAGE_LIMIT_NONMEMBER_TEMPLATE_KEY;
-        const limitTpl = await getTemplate(env, templateKey);
+        const limitTpl = await getTemplate(env, templateKey) || await getTemplate(env, "image_limit");
         if (limitTpl) {
           await sendTemplate(env, userId, limitTpl.key);
         } else if (limitCheck.member) {
           await tgCall(env, "sendMessage", { chat_id: userId, text: "谢谢您的支持，为防止机器人被人恶意爆刷，请于明天再来尝试搜索哦～" });
         } else {
-          await tgCall(env, "sendMessage", { chat_id: userId, text: "普通用户每日搜图上限为5张，请明天再试。" });
+          await tgCall(env, "sendMessage", { chat_id: userId, text: "为了能长期运营下去，普通用户每日搜图上限为5张，想要尽情搜索，就请加入打赏群哦～" });
         }
       }
       return;
     }
     try {
-      try {
-        await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
-      } catch (e) {
-        console.warn("[tg] getFile failed, continue to reply:", e?.message || String(e));
-      }
+      await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
       const imageUrl = await buildSignedProxyUrl(env, requestUrlString, imageInfo.fileId, userId);
       const links = buildImageSearchLinks(imageUrl);
       const tpl = await getTemplate(env, IMAGE_REPLY_TEMPLATE_KEY);
@@ -1780,20 +2930,15 @@ export async function handleWebhook(env, update, requestUrl) {
         google_lens: links.google,
         yandex: links.yandex
       });
-      const basePayload = {
+      await trySendMessage(env, userId, {
         chat_id: userId,
         text: replyText,
         parse_mode: tpl?.parse_mode || "HTML",
         disable_web_page_preview: tpl ? tpl.disable_preview : true,
         reply_markup: replyButtons.length ? buildKeyboard(replyButtons) : undefined,
-      };
-      try {
-        await trySendMessage(env, userId, { ...basePayload, reply_to_message_id: msg.message_id });
-      } catch (e) {
-        console.warn("[tg] reply with message_id failed, retrying without reply:", e?.message || String(e));
-        await trySendMessage(env, userId, basePayload);
-      }
-    } catch {
+        reply_to_message_id: msg.message_id
+      });
+    } catch (e) {
       await tgCall(env, "sendMessage", { chat_id: userId, text: "图片处理失败，请稍后再试。" });
     }
     return;
@@ -1811,7 +2956,21 @@ export async function handleWebhook(env, update, requestUrl) {
           disable_web_page_preview: cmdTpl.disable_preview,
           reply_markup: cmdTpl.buttons?.length ? buildKeyboard(cmdTpl.buttons) : undefined,
         });
+        return;
       }
     }
   }
+
+  if (text) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/")) {
+      const code = extractCardCode(text);
+      if (code && isLikelyCardCode(code)) {
+        await handleCardRedeem(env, userId, code);
+        return;
+      }
+    }
+  }
+
+  // Ignore other messages
 }
