@@ -16,7 +16,7 @@
 ## 2. 创建 D1 和 KV
 ```bash
 # 创建 D1
-wrangler d1 create linyuan-bot
+wrangler d1 create soutu-bot
 
 # 创建 KV
 wrangler kv namespace create KV
@@ -28,8 +28,8 @@ wrangler kv namespace create KV
 
 ## 3. 初始化数据库表
 ```bash
-wrangler d1 execute linyuan-bot --file=./schema.sql
-wrangler d1 execute linyuan-bot --file=./seed.sql
+wrangler d1 execute soutu-bot --file=./schema.sql
+wrangler d1 execute soutu-bot --file=./seed.sql
 ```
 
 ## 4. 配置环境变量与 Secrets
@@ -55,7 +55,7 @@ wrangler deploy
 ```
 
 部署成功后会得到 Worker URL，例如：
-`https://linyuanpic-bot.your-account.workers.dev`
+`https://soutu-bot.linyuan.workers.dev`
 
 ## 6. 设置 Telegram Webhook
 把 Webhook 指向：
@@ -74,10 +74,10 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook"   -H "content-
 `bot.example.com`
 
 然后 webhook 指向：
-`https://bot.example.com/tg/webhook`
+`https://soutu.linyuan.cc/tg/webhook`
 
 后台地址：
-`https://bot.example.com/admin`
+`https://soutu.linyuan.cc/admin`
 
 ## 8. 后台登录方式（管理员 TG user_id）
 1) 在 Telegram 私聊机器人发送：`/login`
