@@ -157,8 +157,6 @@ export function appendFixedStartButtons(buttonsFromTpl) {
   const rows = Array.isArray(buttonsFromTpl) ? buttonsFromTpl.slice() : [];
   // Ensure it's 2D
   const norm = rows.map(r => Array.isArray(r) ? r : []);
-  norm.push([{ text: "验证卡密", type: "callback", data: "VERIFY" }]);
-  norm.push([{ text: "人工客服", type: "callback", data: "SUPPORT" }]);
   return norm;
 }
 

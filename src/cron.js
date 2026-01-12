@@ -1,7 +1,5 @@
 import { getDb, getMembership, validateEnv } from "./db.js";
 import { syncExpiredUsers, syncVipCache } from "./auth.js";
-import { kickExpired } from "./group.js";
-import { processAutoRules } from "./notify.js";
 import { sendTemplate } from "./telegram.js";
 import { fmtDateTime, nowSec } from "./utils.js";
 
@@ -90,7 +88,5 @@ export async function scheduled(event, env, ctx) {
     await syncVipCache(env);
     await syncExpiredUsers(env);
     await processBroadcastJobs(env);
-    await processAutoRules(env);
-    await kickExpired(env);
   })());
 }
