@@ -4,6 +4,8 @@ import {
   IMAGE_REPLY_DEFAULT_BUTTONS,
   IMAGE_REPLY_DEFAULT_TEXT,
   IMAGE_REPLY_TEMPLATE_KEY,
+  START_DEFAULT_BUTTONS,
+  START_DEFAULT_TEXT,
   TEMPLATE_SORT_ORDER,
   JSON_HEADERS,
 } from "./config.js";
@@ -1699,13 +1701,13 @@ export async function handleWebhook(env, update, requestUrl) {
     if (data === "/start" || data === "START") {
       await ensureBotCommands(env);
       const tpl = await getTemplate(env, "start");
-      if (!tpl) return;
+      const startButtons = tpl?.buttons?.length ? tpl.buttons : START_DEFAULT_BUTTONS;
       await trySendMessage(env, userId, {
         chat_id: userId,
-        text: normalizeTelegramHtml(tpl.text),
-        parse_mode: tpl.parse_mode,
-        disable_web_page_preview: tpl.disable_preview,
-        reply_markup: tpl.buttons?.length ? buildKeyboard(tpl.buttons) : undefined,
+        text: normalizeTelegramHtml(tpl?.text || START_DEFAULT_TEXT),
+        parse_mode: tpl?.parse_mode || "HTML",
+        disable_web_page_preview: tpl ? tpl.disable_preview : false,
+        reply_markup: startButtons.length ? buildKeyboard(startButtons) : undefined,
       });
     }
     return;
@@ -1725,15 +1727,14 @@ export async function handleWebhook(env, update, requestUrl) {
   if (text.startsWith("/start")) {
     await ensureBotCommands(env);
     const tpl = await getTemplate(env, "start");
-    if (tpl) {
-      await trySendMessage(env, userId, {
-        chat_id: userId,
-        text: normalizeTelegramHtml(tpl.text),
-        parse_mode: tpl.parse_mode,
-        disable_web_page_preview: tpl.disable_preview,
-        reply_markup: tpl.buttons?.length ? buildKeyboard(tpl.buttons) : undefined,
-      });
-    }
+    const startButtons = tpl?.buttons?.length ? tpl.buttons : START_DEFAULT_BUTTONS;
+    await trySendMessage(env, userId, {
+      chat_id: userId,
+      text: normalizeTelegramHtml(tpl?.text || START_DEFAULT_TEXT),
+      parse_mode: tpl?.parse_mode || "HTML",
+      disable_web_page_preview: tpl ? tpl.disable_preview : false,
+      reply_markup: startButtons.length ? buildKeyboard(startButtons) : undefined,
+    });
     return;
   }
 
