@@ -19,12 +19,100 @@ export async function handleAdminApi(env, req, path) {
 
   if (path === "/admin/stats" && req.method === "GET") {
     const today = new Date();
-    const ymd = today.toISOString().slice(0, 10);
-    const searches = await env.DB.prepare(
-      "SELECT COUNT(*) as total, COUNT(DISTINCT user_id) as users FROM search_logs WHERE date(timestamp, 'unixepoch') = ?"
-    ).bind(ymd).first();
-    const members = await env.DB.prepare("SELECT COUNT(*) as total FROM members WHERE status='active'").first();
-    return new Response(JSON.stringify({ ok: true, data: { searches, members } }), { headers: JSON_HEADERS });
+    const days = [];
+    for (let i = 6; i >= 0; i -= 1) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+
+    const totalUsers = await env.DB.prepare("SELECT COUNT(DISTINCT user_id) as total FROM search_logs").first();
+    const weekNewUsers = await env.DB.prepare(
+      `SELECT COUNT(*) as total FROM (
+        SELECT user_id, MIN(date(timestamp, 'unixepoch')) as first_date
+        FROM search_logs
+        GROUP BY user_id
+      ) WHERE first_date >= date('now', '-6 days')`
+    ).first();
+    const monthNewUsers = await env.DB.prepare(
+      `SELECT COUNT(*) as total FROM (
+        SELECT user_id, MIN(date(timestamp, 'unixepoch')) as first_date
+        FROM search_logs
+        GROUP BY user_id
+      ) WHERE first_date >= date('now', 'start of month')`
+    ).first();
+    const weekSearchUsers = await env.DB.prepare(
+      "SELECT COUNT(DISTINCT user_id) as total FROM search_logs WHERE date(timestamp, 'unixepoch') >= date('now', '-6 days')"
+    ).first();
+    const monthSearchUsers = await env.DB.prepare(
+      "SELECT COUNT(DISTINCT user_id) as total FROM search_logs WHERE date(timestamp, 'unixepoch') >= date('now', 'start of month')"
+    ).first();
+    const weekSearchCount = await env.DB.prepare(
+      "SELECT COUNT(*) as total FROM search_logs WHERE date(timestamp, 'unixepoch') >= date('now', '-6 days')"
+    ).first();
+    const monthSearchCount = await env.DB.prepare(
+      "SELECT COUNT(*) as total FROM search_logs WHERE date(timestamp, 'unixepoch') >= date('now', 'start of month')"
+    ).first();
+    const totalMembers = await env.DB.prepare("SELECT COUNT(*) as total FROM members WHERE status='active'").first();
+    const weekNewMembers = await env.DB.prepare(
+      "SELECT COUNT(*) as total FROM members WHERE status='active' AND date(updated_at, 'unixepoch') >= date('now', '-6 days')"
+    ).first();
+    const monthNewMembers = await env.DB.prepare(
+      "SELECT COUNT(*) as total FROM members WHERE status='active' AND date(updated_at, 'unixepoch') >= date('now', 'start of month')"
+    ).first();
+
+    const newUserRows = await env.DB.prepare(
+      `SELECT first_date as day, COUNT(*) as total FROM (
+        SELECT user_id, MIN(date(timestamp, 'unixepoch')) as first_date
+        FROM search_logs
+        GROUP BY user_id
+      ) WHERE first_date >= date('now', '-6 days')
+      GROUP BY first_date`
+    ).all();
+    const newMemberRows = await env.DB.prepare(
+      "SELECT date(updated_at, 'unixepoch') as day, COUNT(*) as total FROM members WHERE status='active' AND date(updated_at, 'unixepoch') >= date('now', '-6 days') GROUP BY day"
+    ).all();
+    const searchRows = await env.DB.prepare(
+      "SELECT date(timestamp, 'unixepoch') as day, COUNT(*) as total, COUNT(DISTINCT user_id) as users FROM search_logs WHERE date(timestamp, 'unixepoch') >= date('now', '-6 days') GROUP BY day"
+    ).all();
+
+    const mapByDay = (rows, key = "total") => {
+      const map = new Map();
+      (rows.results || []).forEach(row => map.set(row.day, row[key]));
+      return days.map(day => map.get(day) || 0);
+    };
+
+    const searchMap = new Map();
+    (searchRows.results || []).forEach(row => {
+      searchMap.set(row.day, row);
+    });
+
+    const searchCounts = days.map(day => (searchMap.get(day)?.total || 0));
+    const searchUsers = days.map(day => (searchMap.get(day)?.users || 0));
+
+    const data = {
+      summary: {
+        users_total: totalUsers?.total || 0,
+        users_week_new: weekNewUsers?.total || 0,
+        users_month_new: monthNewUsers?.total || 0,
+        searches_week_users: weekSearchUsers?.total || 0,
+        searches_month_users: monthSearchUsers?.total || 0,
+        members_total: totalMembers?.total || 0,
+        members_week_new: weekNewMembers?.total || 0,
+        members_month_new: monthNewMembers?.total || 0,
+        searches_week_count: weekSearchCount?.total || 0,
+        searches_month_count: monthSearchCount?.total || 0,
+      },
+      series: {
+        days,
+        new_users: mapByDay(newUserRows),
+        new_members: mapByDay(newMemberRows),
+        search_counts: searchCounts,
+        search_users: searchUsers,
+      },
+    };
+
+    return new Response(JSON.stringify({ ok: true, data }), { headers: JSON_HEADERS });
   }
 
   if (path === "/admin/templates" && req.method === "GET") {
