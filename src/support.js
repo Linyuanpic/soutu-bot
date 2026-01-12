@@ -225,7 +225,8 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
   const userId = msg.from?.id;
   if (!Number.isFinite(userId)) return false;
   if (isVideoMessage(msg)) {
-    if (await shouldNotifyVideoWarning(env, userId)) {
+    const warned = await shouldNotifyVideoWarning(env, userId);
+    if (warned || await shouldNotifyCooldown(env, `video_warn_cd:${userId}`, 600)) {
       await recordDailyImageReminder(env, userId);
       await tgCall(env, "sendMessage", { chat_id: userId, text: "本机器人只支持图片搜索哦～" });
     }
@@ -237,7 +238,8 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
   const limitCheck = await checkDailyImageLimit(env, userId);
   if (!limitCheck.allowed) {
     const tierKey = limitCheck.member ? "member" : "nonmember";
-    if (await shouldNotifyImageLimit(env, userId, tierKey)) {
+    const notifyLimit = await shouldNotifyImageLimit(env, userId, tierKey);
+    if (notifyLimit || await shouldNotifyCooldown(env, `image_limit_cd:${tierKey}:${userId}`, 600)) {
       const templateKey = limitCheck.member ? IMAGE_LIMIT_MEMBER_TEMPLATE_KEY : IMAGE_LIMIT_NONMEMBER_TEMPLATE_KEY;
       const limitTpl = await getTemplate(env, templateKey) || await getTemplate(env, "image_limit");
       if (limitTpl) {
@@ -304,7 +306,8 @@ function bufferSearchMediaGroup(env, msg, requestUrlString) {
       return;
     }
     const userId = currentEntry.userId;
-    if (Number.isFinite(userId) && await shouldNotifyMediaGroup(env, userId, groupId)) {
+    if (Number.isFinite(userId) && (await shouldNotifyMediaGroup(env, userId, groupId)
+      || await shouldNotifyCooldown(env, `media_group_cd:${userId}`, 600))) {
       await recordDailyImageReminder(env, userId);
       await tgCall(env, "sendMessage", { chat_id: userId, text: "请发送一张图片进行搜索哦～" });
     }
@@ -392,6 +395,15 @@ async function shouldNotifySupportMediaGroup(env, groupId) {
   const notified = await kv.get(key);
   if (notified) return false;
   await kv.put(key, "1", { expirationTtl: 120 });
+  return true;
+}
+
+async function shouldNotifyCooldown(env, key, ttlSec) {
+  const kv = getKv(env);
+  if (!kv) return true;
+  const notified = await kv.get(key);
+  if (notified) return false;
+  await kv.put(key, "1", { expirationTtl: ttlSec });
   return true;
 }
 
