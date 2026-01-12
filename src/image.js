@@ -1,7 +1,5 @@
 import {
   FILE_PATH_CACHE_TTL,
-  IMAGE_DAILY_LIMIT_MEMBER,
-  IMAGE_DAILY_LIMIT_NON_MEMBER,
   IMAGE_PROXY_PREFIX,
   IMAGE_PROXY_RATE_LIMIT,
   IMAGE_PROXY_RATE_WINDOW,
@@ -10,7 +8,6 @@ import {
   JSON_HEADERS,
 } from "./config.js";
 import { getKv } from "./kv.js";
-import { isMember } from "./auth.js";
 import { tgCall } from "./telegram.js";
 import { nowSec, normalizeBaseUrl, toBase64Url, getTzDateKey } from "./utils.js";
 
@@ -112,19 +109,6 @@ export function buildImageSearchLinks(url) {
   };
 }
 
-export async function checkDailyImageLimit(env, userId) {
-  const member = await isMember(env, userId);
-  const limit = member ? IMAGE_DAILY_LIMIT_MEMBER : IMAGE_DAILY_LIMIT_NON_MEMBER;
-  const dayKey = getTzDateKey(nowSec(), env.TZ);
-  const kv = getKv(env);
-  const key = `image_count:${dayKey}:${userId}`;
-  const current = Number(await kv.get(key) || 0);
-  if (current >= limit) return { allowed: false, current, limit, member };
-  await kv.put(key, String(current + 1), { expirationTtl: 2 * 86400 });
-  await recordDailyImageStats(env, userId);
-  return { allowed: true, current: current + 1, limit, member };
-}
-
 export async function recordDailyImageStats(env, userId) {
   if (!userId) return;
   const dayKey = getTzDateKey(nowSec(), env.TZ);
@@ -140,25 +124,6 @@ export async function recordDailyImageStats(env, userId) {
     const userTotal = Number(await kv.get(userTotalKey) || 0);
     await kv.put(userTotalKey, String(userTotal + 1), { expirationTtl: 40 * 86400 });
   }
-}
-
-export async function recordDailyImageReminder(env, userId) {
-  if (!userId) return;
-  const dayKey = getTzDateKey(nowSec(), env.TZ);
-  const kv = getKv(env);
-  const key = `image_count:${dayKey}:${userId}`;
-  const current = Number(await kv.get(key) || 0);
-  await kv.put(key, String(current + 1), { expirationTtl: 2 * 86400 });
-  await recordDailyImageStats(env, userId);
-}
-
-export async function shouldNotifyImageLimit(env, userId, tier) {
-  const dayKey = getTzDateKey(nowSec(), env.TZ);
-  const key = `image_limit_notified:${dayKey}:${userId}:${tier}`;
-  const notified = await getKv(env).get(key);
-  if (notified) return false;
-  await getKv(env).put(key, "1", { expirationTtl: 2 * 86400 });
-  return true;
 }
 
 export async function shouldNotifyVideoWarning(env, userId) {
