@@ -7,8 +7,9 @@ export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
     const path = url.pathname;
+    const normalizedPath = path === "/bot/webhook/admin" ? "/admin" : path;
 
-    if (path === "/bot/webhook" && req.method === "POST") {
+    if (normalizedPath === "/bot/webhook" && req.method === "POST") {
       const raw = await req.text();
       let update;
       try {
@@ -20,11 +21,11 @@ export default {
       return new Response(JSON.stringify({ ok: true }), { headers: JSON_HEADERS });
     }
 
-    if (path.startsWith(IMAGE_PROXY_PREFIX) && req.method === "GET") {
+    if (normalizedPath.startsWith(IMAGE_PROXY_PREFIX) && req.method === "GET") {
       return handleImageProxyRequest(env, req, url);
     }
 
-    if (path === "/admin" || path === "/") {
+    if (normalizedPath === "/admin" || normalizedPath === "/") {
       const token = url.searchParams.get("token");
       if (token) {
         const userId = await consumeAdminLoginToken(env, token);
@@ -46,8 +47,8 @@ export default {
       return new Response(loginHtml(), { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
-    if (path.startsWith("/api/admin/")) {
-      return handleAdminApi(env, req, path);
+    if (normalizedPath.startsWith("/api/admin/")) {
+      return handleAdminApi(env, req, normalizedPath);
     }
 
     return new Response("Not Found", { status: 404 });
