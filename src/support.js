@@ -2925,7 +2925,7 @@ export async function handleWebhook(env, update, requestUrl) {
         google_lens: links.google,
         yandex: links.yandex
       }));
-      const replyButtons = renderButtonsWithVars(tpl?.buttons || IMAGE_REPLY_DEFAULT_BUTTONS, {
+      const replyButtons = renderButtonsWithVars(tpl?.buttons?.length ? tpl.buttons : IMAGE_REPLY_DEFAULT_BUTTONS, {
         image_url: imageUrl,
         google_lens: links.google,
         yandex: links.yandex
