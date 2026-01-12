@@ -10,6 +10,12 @@ export const TEMPLATE_SORT_ORDER = [
 export const IMAGE_REPLY_TEMPLATE_KEY = "image_reply";
 export const IMAGE_LIMIT_MEMBER_TEMPLATE_KEY = "image_limit_member";
 export const IMAGE_LIMIT_NONMEMBER_TEMPLATE_KEY = "image_limit_nonmember";
+export const START_DEFAULT_TEXT = "/start 指令自动回复首页内容\n加入下方任意一个群组，都可免费无限次使用搜图机器人哦～";
+export const START_DEFAULT_BUTTONS = [
+  [{ text: "会员赞助", type: "url", url: "https://t.me/orzboy_bot?start=bUPHj9WUw0fmYEP" }],
+  [{ text: "资源合集", type: "url", url: "https://t.me/orzboy_bot?start=kY7cFpjD0fjsEO0" }],
+  [{ text: "查找出处", type: "url", url: "https://t.me/orzboy_bot?start=A9G93w5qiYAspSW" }]
+];
 export const IMAGE_REPLY_DEFAULT_TEXT = "自助搜图，具体内容点击下方按钮～";
 export const IMAGE_REPLY_DEFAULT_BUTTONS = [
   [{ text: "GoogleLens → 看看这是谁", type: "url", url: "{{google_lens}}" }],

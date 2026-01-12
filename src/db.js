@@ -1,4 +1,11 @@
-import { DEFAULT_D1_BINDING, DEFAULT_KV_BINDING } from "./config.js";
+import {
+  DEFAULT_D1_BINDING,
+  DEFAULT_KV_BINDING,
+  IMAGE_REPLY_DEFAULT_BUTTONS,
+  IMAGE_REPLY_DEFAULT_TEXT,
+  START_DEFAULT_BUTTONS,
+  START_DEFAULT_TEXT,
+} from "./config.js";
 import { resolveBindingName, nowSec } from "./utils.js";
 import { getKv } from "./kv.js";
 
@@ -127,6 +134,51 @@ export async function ensureSchema(env) {
           updated_at INTEGER NOT NULL
         )`
       ).run();
+      const t = nowSec();
+      const defaultTemplates = [
+        {
+          key: "start",
+          title: "/start 首页",
+          disable_preview: 0,
+          text: START_DEFAULT_TEXT,
+          buttons: START_DEFAULT_BUTTONS,
+        },
+        {
+          key: "image_limit_nonmember",
+          title: "图片搜索上限：普通用户",
+          disable_preview: 0,
+          text: "普通用户每日搜图上限为5张，请明天再试。",
+          buttons: [],
+        },
+        {
+          key: "image_limit_member",
+          title: "图片搜索上限：会员",
+          disable_preview: 0,
+          text: "谢谢您的支持，为防止机器人被人恶意爆刷，请于明天再来尝试搜索哦～",
+          buttons: [],
+        },
+        {
+          key: "image_reply",
+          title: "图片回复模版",
+          disable_preview: 1,
+          text: IMAGE_REPLY_DEFAULT_TEXT,
+          buttons: IMAGE_REPLY_DEFAULT_BUTTONS,
+        },
+      ];
+      for (const tpl of defaultTemplates) {
+        await db.prepare(
+          `INSERT OR IGNORE INTO templates(key,title,parse_mode,disable_preview,text,buttons_json,updated_at)
+           VALUES (?,?,?,?,?,?,?)`
+        ).bind(
+          tpl.key,
+          tpl.title,
+          "HTML",
+          tpl.disable_preview,
+          tpl.text,
+          JSON.stringify(tpl.buttons || []),
+          t
+        ).run();
+      }
     })();
   }
   await schemaReady;

@@ -1,8 +1,12 @@
 -- Basic templates
 INSERT OR IGNORE INTO templates (key,title,parse_mode,disable_preview,text,buttons_json,updated_at) VALUES
 ('start','/start 首页','HTML',0,
-'发送图片即可自动搜图。\n\n管理员可在后台设置群组并进行广播。',
-'[]',
+'/start 指令自动回复首页内容\n加入下方任意一个群组，都可免费无限次使用搜图机器人哦～',
+'[
+  [{"text":"会员赞助","type":"url","url":"https://t.me/orzboy_bot?start=bUPHj9WUw0fmYEP"}],
+  [{"text":"资源合集","type":"url","url":"https://t.me/orzboy_bot?start=kY7cFpjD0fjsEO0"}],
+  [{"text":"查找出处","type":"url","url":"https://t.me/orzboy_bot?start=A9G93w5qiYAspSW"}]
+]',
 strftime('%s','now')),
 
 ('image_limit_nonmember','图片搜索上限：普通用户','HTML',0,
