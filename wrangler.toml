@@ -2,8 +2,6 @@ name = "soutu-bot"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-routes = [{ pattern = "soutu.linyuan.cc/*", custom_domain = true }]
-
 [[kv_namespaces]]
 binding = "KV"
 id = "b55a275566a34c3f81a2903e14af4a19"
@@ -12,6 +10,8 @@ id = "b55a275566a34c3f81a2903e14af4a19"
 binding = "DB"
 database_name = "soutu-bot"
 database_id = "bca36663-b43f-426c-972e-fcece7125987"
+
+routes = [{ pattern = "soutu.linyuan.cc/*", custom_domain = true }]
 
 [vars]
 TZ = "Asia/Shanghai"
