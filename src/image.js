@@ -9,6 +9,7 @@ import {
   IMAGE_PROXY_TTL_SEC,
   JSON_HEADERS,
 } from "./config.js";
+import { isMember } from "./auth.js";
 import { getKv } from "./kv.js";
 import { tgCall } from "./telegram.js";
 import { nowSec, normalizeBaseUrl, toBase64Url, getTzDateKey } from "./utils.js";

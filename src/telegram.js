@@ -70,7 +70,10 @@ export async function ensureBotCommands(env) {
   if (await kv.get(key)) return;
   try {
     await tgCall(env, "setMyCommands", {
-      commands: [{ command: "start", description: "开始 - 打开首页" }],
+      commands: [
+        { command: "start", description: "开始 - 打开首页" },
+        { command: "stars", description: "星标菜单 - 打开功能菜单" }
+      ],
       scope: { type: "all_private_chats" }
     });
     await kv.put(key, "1", { expirationTtl: 86400 });
