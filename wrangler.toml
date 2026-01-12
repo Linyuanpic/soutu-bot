@@ -19,6 +19,7 @@ crons = ["*/5 * * * *"]
 ADMIN_USER_IDS = "7204268059"
 TZ = "Asia/Shanghai"
 
-[routes]
+[[routes]]
 # Custom domain route
-"soutu.linyuan.cc/*" = { zone_name = "linyuan.cc" }
+pattern = "soutu.linyuan.cc/*"
+zone_name = "linyuan.cc"
