@@ -61,6 +61,23 @@ export async function addMembershipDays(env, userId, days) {
   return { wasMember: !!(m && m.expire_at > t), expire_at: expire };
 }
 
+export async function ensureMembershipThrough(env, userId, expireAt) {
+  const t = nowSec();
+  const targetExpire = Number(expireAt);
+  if (!Number.isFinite(userId) || !Number.isFinite(targetExpire)) return null;
+  const m = await getMembership(env, userId);
+  if (m && m.expire_at >= targetExpire) return { updated: false, expire_at: m.expire_at };
+  if (m) {
+    await getDb(env).prepare(`UPDATE memberships SET expire_at=?, updated_at=? WHERE user_id=?`).bind(targetExpire, t, userId).run();
+  } else {
+    await getDb(env).prepare(`INSERT INTO memberships(user_id, verified_at, expire_at, updated_at) VALUES (?,?,?,?)`)
+      .bind(userId, t, targetExpire, t).run();
+  }
+  await setVipCache(env, userId, targetExpire);
+  await getDb(env).prepare(`DELETE FROM expired_users WHERE user_id=?`).bind(userId).run();
+  return { updated: true, expire_at: targetExpire };
+}
+
 export async function checkDailyDmLimit(env, userId, isAdmin) {
   if (isAdmin) return { allowed: true, remaining: null };
   const member = await isMember(env, userId);

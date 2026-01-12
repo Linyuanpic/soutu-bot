@@ -76,6 +76,11 @@ export function getTzDateKey(tsSec, tz = "Asia/Shanghai") {
   return `${parts.year}-${mm}-${dd}`;
 }
 
+export function getTzDateKeyWithOffset(tsSec, tz = "Asia/Shanghai", offsetHour = 0) {
+  const offsetSec = Number(offsetHour || 0) * 3600;
+  return getTzDateKey(tsSec - offsetSec, tz);
+}
+
 export function fmtDateTime(tsSec, tz = "Asia/Shanghai") {
   // Use Intl for timezone formatting
   const dt = new Date(tsSec * 1000);
@@ -150,6 +155,13 @@ export function toBase64Url(buf) {
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
     .replace(/=+$/, "");
+}
+
+export function getBotUserId(env) {
+  const token = String(env?.BOT_TOKEN || "");
+  const idStr = token.split(":")[0];
+  const id = Number(idStr);
+  return Number.isFinite(id) ? id : null;
 }
 
 /** Fixed buttons for /start */

@@ -4,17 +4,21 @@ import {
   IMAGE_REPLY_TEMPLATE_KEY,
   TEMPLATE_SORT_ORDER,
   JSON_HEADERS,
+  GROUP_MEMBER_EXPIRE_DAYS,
 } from "./config.js";
-import { ensureUser, getDb, getTemplate } from "./db.js";
+import { ensureUser, getDb, getTemplate, upsertManagedChat } from "./db.js";
 import { getKv } from "./kv.js";
 import {
   buildImageSearchLinks,
   buildSignedProxyUrl,
+  getDailySearchStatus,
   recordDailyImageStats,
+  recordDailySearchCount,
   getTelegramFilePath,
   shouldNotifyMediaGroup,
   shouldNotifyVideoWarning,
 } from "./image.js";
+import { ensureMembershipThrough, isMember } from "./auth.js";
 import { ensureBotCommands, tgCall, trySendMessage } from "./telegram.js";
 import {
   appendFixedStartButtons,
@@ -27,6 +31,7 @@ import {
   getTzDateKey,
   getTzDayStart,
   getTzWeekStart,
+  getBotUserId,
   isPrivateChat,
   isVideoMessage,
   normalizeTelegramHtml,
@@ -37,6 +42,28 @@ import {
 } from "./utils.js";
 const SEARCH_MEDIA_GROUP_BUFFER_MS = 500;
 const searchMediaGroupBuffers = new Map();
+
+async function sendStartTemplate(env, userId) {
+  await ensureBotCommands(env);
+  const tpl = await getTemplate(env, "start");
+  if (!tpl) throw new Error("Missing template: start");
+  const buttons = appendFixedStartButtons(tpl.buttons);
+  await trySendMessage(env, userId, {
+    chat_id: userId,
+    text: normalizeTelegramHtml(tpl.text),
+    parse_mode: tpl.parse_mode,
+    disable_web_page_preview: tpl.disable_preview,
+    reply_markup: buildKeyboard(buttons),
+  });
+}
+
+async function markGroupUserAsMember(env, user) {
+  const userId = user?.id;
+  if (!Number.isFinite(userId)) return;
+  await ensureUser(env, user);
+  const expireAt = nowSec() + GROUP_MEMBER_EXPIRE_DAYS * 86400;
+  await ensureMembershipThrough(env, userId, expireAt);
+}
 
 async function handleImageOrVideoMessage(env, msg, requestUrlString) {
   const userId = msg.from?.id;
@@ -51,6 +78,16 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
 
   const imageInfo = getMessageImageInfo(msg);
   if (!imageInfo) return false;
+  const member = await isMember(env, userId);
+  const searchStatus = await getDailySearchStatus(env, userId, member);
+  if (!searchStatus.allowed) {
+    if (member) {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "服务器异常，请稍后再尝试搜索。" });
+    } else {
+      await sendStartTemplate(env, userId);
+    }
+    return true;
+  }
   try {
     await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
     const imageUrl = await buildSignedProxyUrl(env, requestUrlString, imageInfo.fileId, userId);
@@ -75,6 +112,7 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
       reply_to_message_id: msg.message_id
     });
     await recordDailyImageStats(env, userId);
+    await recordDailySearchCount(env, userId);
   } catch (e) {
     await tgCall(env, "sendMessage", { chat_id: userId, text: "图片处理失败，请稍后再试。" });
   }
@@ -124,6 +162,52 @@ async function shouldNotifyCooldown(env, key, ttlSec) {
   return true;
 }
 
+async function handleBotAddedToChat(env, chat, inviterId) {
+  const adminIds = parseAdminIds(env);
+  const chatId = chat?.id;
+  if (!Number.isFinite(chatId)) return;
+  if (!adminIds.includes(inviterId)) {
+    await tgCall(env, "leaveChat", { chat_id: chatId });
+    return;
+  }
+  await upsertManagedChat(env, chat);
+}
+
+async function handleGroupMessage(env, msg) {
+  const chatType = msg?.chat?.type;
+  if (!["group", "supergroup", "channel"].includes(chatType)) return false;
+  const botId = getBotUserId(env);
+  if (botId && Array.isArray(msg?.new_chat_members)) {
+    const addedBot = msg.new_chat_members.some(member => member?.id === botId);
+    if (addedBot) {
+      await handleBotAddedToChat(env, msg.chat, msg.from?.id);
+      return true;
+    }
+  }
+  if (Array.isArray(msg?.new_chat_members)) {
+    for (const member of msg.new_chat_members) {
+      if (member?.id && member.id !== botId) {
+        await markGroupUserAsMember(env, member);
+      }
+    }
+  }
+  if (msg.from?.id && msg.from.id !== botId) {
+    await markGroupUserAsMember(env, msg.from);
+  }
+  return true;
+}
+
+async function handleBotChatMemberUpdate(env, payload) {
+  const botId = getBotUserId(env);
+  if (!botId) return false;
+  const chat = payload?.chat;
+  const newMember = payload?.new_chat_member;
+  if (newMember?.user?.id !== botId) return false;
+  const status = newMember?.status || "";
+  if (!["member", "administrator"].includes(status)) return false;
+  await handleBotAddedToChat(env, chat, payload?.from?.id);
+  return true;
+}
 /** Admin login: /login in bot DM generates a one-time link */
 export async function handleAdminLoginCommand(env, msg, origin) {
   const adminIds = parseAdminIds(env);
@@ -1687,8 +1771,12 @@ export async function handleWebhook(env, update, requestUrl) {
   // Track users who DM the bot
   const msg = update.message;
   const cbq = update.callback_query;
+  const myChatMember = update.my_chat_member;
 
   if (msg && msg.from?.id) await ensureUser(env, msg.from);
+  if (myChatMember) {
+    await handleBotChatMemberUpdate(env, myChatMember);
+  }
 
   // Callback query buttons
   if (cbq) {
@@ -1702,17 +1790,7 @@ export async function handleWebhook(env, update, requestUrl) {
     if (!isPrivateChat(cbq.message)) return;
 
     if (data === "/start" || data === "START") {
-      await ensureBotCommands(env);
-      const tpl = await getTemplate(env, "start");
-      if (!tpl) throw new Error("Missing template: start");
-      const buttons = appendFixedStartButtons(tpl.buttons);
-      await trySendMessage(env, userId, {
-        chat_id: userId,
-        text: normalizeTelegramHtml(tpl.text),
-        parse_mode: tpl.parse_mode,
-        disable_web_page_preview: tpl.disable_preview,
-        reply_markup: buildKeyboard(buttons),
-      });
+      await sendStartTemplate(env, userId);
       return;
     }
     return;
@@ -1720,7 +1798,10 @@ export async function handleWebhook(env, update, requestUrl) {
 
   // Messages
   if (!msg) return;
-  if (!isPrivateChat(msg)) return;
+  if (!isPrivateChat(msg)) {
+    await handleGroupMessage(env, msg);
+    return;
+  }
 
   const userId = msg.from?.id;
   const text = msg.text || msg.caption || "";
@@ -1733,17 +1814,7 @@ export async function handleWebhook(env, update, requestUrl) {
   }
 
   if (text.startsWith("/start")) {
-    await ensureBotCommands(env);
-    const tpl = await getTemplate(env, "start");
-    if (!tpl) throw new Error("Missing template: start");
-    const buttons = appendFixedStartButtons(tpl.buttons);
-    await trySendMessage(env, userId, {
-      chat_id: userId,
-      text: normalizeTelegramHtml(tpl.text),
-      parse_mode: tpl.parse_mode,
-      disable_web_page_preview: tpl.disable_preview,
-      reply_markup: buildKeyboard(buttons),
-    });
+    await sendStartTemplate(env, userId);
     return;
   }
 
