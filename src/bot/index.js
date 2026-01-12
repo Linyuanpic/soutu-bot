@@ -3,7 +3,7 @@ import {
   DEFAULT_SEARCH_TEXT,
   TEMPLATE_KEYS,
 } from "../config.js";
-import { getTemplateByKey, pickSearchTemplate } from "../admin/index.js";
+import { getTemplateByKey, handleAdminLoginCommand, pickSearchTemplate } from "../admin/index.js";
 import { isMember } from "../members/index.js";
 import { checkGroupQuota, checkPrivateQuota } from "../quota/index.js";
 import { buildImageSearchLinks, buildSignedProxyUrl, getTelegramFilePath } from "../search/index.js";
@@ -96,6 +96,10 @@ export async function handleWebhook(env, update, requestUrl) {
   }
 
   if (isPrivateChat(msg)) {
+    if (command === "login") {
+      await handleAdminLoginCommand(env, msg, requestUrl);
+      return new Response("ok");
+    }
     if (!wantsSearch) return new Response("ok");
     const memberOk = await isMember(env, msg.from.id);
     if (!memberOk) {
