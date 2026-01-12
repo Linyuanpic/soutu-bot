@@ -1,15 +1,15 @@
-name = "telegram-bot"
+name = "soutu-bot"
 main = "src/index.js"
 compatibility_date = "2026-01-10"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "telegram-bot"
-database_id = "eeddd9c9-7db3-4eb4-bb94-b4b311b258ec"
+database_name = "soutu-bot"
+database_id = "bca36663-b43f-426c-972e-fcece7125987"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "61884290f78648e6b004363952a3cdb2"
+id = "b55a275566a34c3f81a2903e14af4a19"
 
 [triggers]
 crons = ["*/5 * * * *"]
@@ -19,4 +19,6 @@ crons = ["*/5 * * * *"]
 ADMIN_USER_IDS = "7204268059"
 TZ = "Asia/Shanghai"
 
-# You will set secrets via: wrangler secret put BOT_TOKEN
+[routes]
+# Custom domain route
+"soutu.linyuan.cc/*" = { zone_name = "linyuan.cc" }
