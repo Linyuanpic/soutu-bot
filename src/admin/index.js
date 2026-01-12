@@ -17,10 +17,26 @@ function getKv(env) {
   return env.KV;
 }
 
-export async function handleAdminLoginCommand(env, msg, origin) {
+async function isAdminUser(env, userId) {
+  if (!Number.isFinite(userId)) return false;
   const adminIds = parseAdminIds(env);
+  if (adminIds.includes(userId)) return true;
+  const row = await env.DB.prepare("SELECT 1 as ok FROM admins WHERE user_id = ? LIMIT 1")
+    .bind(userId)
+    .first();
+  return Boolean(row);
+}
+
+export async function handleAdminLoginCommand(env, msg, origin) {
   const fromId = msg.from?.id;
-  if (!adminIds.includes(fromId)) return;
+  const isAdmin = await isAdminUser(env, fromId);
+  if (!isAdmin) {
+    await tgCall(env, "sendMessage", {
+      chat_id: fromId,
+      text: "仅管理员可登录后台，请先配置管理员账号。",
+    });
+    return;
+  }
   const token = crypto.randomUUID().replaceAll("-", "");
   await getKv(env).put(`admin_login_token:${token}`, String(fromId), { expirationTtl: 600 });
   const loginUrl = `${origin}/admin?token=${encodeURIComponent(token)}`;
@@ -53,8 +69,8 @@ export async function consumeAdminLoginToken(env, token) {
   const uidStr = await getKv(env).get(`admin_login_token:${token}`);
   if (!uidStr) return null;
   const userId = Number(uidStr);
-  const adminIds = parseAdminIds(env);
-  if (!adminIds.includes(userId)) return null;
+  const isAdmin = await isAdminUser(env, userId);
+  if (!isAdmin) return null;
   await getKv(env).delete(`admin_login_token:${token}`);
   return userId;
 }
