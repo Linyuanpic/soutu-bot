@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>搜图机器人后台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>搜图机器人后台</h1>
+    <nav>
+      <button data-tab="dashboard">Dashboard</button>
+      <button data-tab="templates">Templates</button>
+      <button data-tab="members">Members</button>
+      <button data-tab="broadcast">Broadcast</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="dashboard" class="tab">
+      <h2>今日概览</h2>
+      <div id="stats"></div>
+    </section>
+
+    <section id="templates" class="tab hidden">
+      <h2>模板管理</h2>
+      <form id="templateForm">
+        <label>Key <input name="key" required /></label>
+        <label>Type <select name="type">
+          <option value="search_reply">search_reply</option>
+          <option value="auto_reply">auto_reply</option>
+        </select></label>
+        <label>Content <textarea name="content"></textarea></label>
+        <label>Buttons(JSON) <textarea name="buttons">[]</textarea></label>
+        <label><input type="checkbox" name="is_enabled" checked /> 启用</label>
+        <button type="submit">保存</button>
+      </form>
+      <pre id="templateList"></pre>
+    </section>
+
+    <section id="members" class="tab hidden">
+      <h2>会员列表</h2>
+      <pre id="memberList"></pre>
+    </section>
+
+    <section id="broadcast" class="tab hidden">
+      <h2>群发</h2>
+      <form id="broadcastForm">
+        <textarea name="content" placeholder="输入群发内容" required></textarea>
+        <button type="submit">发送</button>
+      </form>
+      <pre id="broadcastList"></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
