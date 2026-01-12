@@ -31,6 +31,11 @@ export async function ensureSchema(env) {
           last_name TEXT
         )`
       ).run();
+      const userColumns = await db.prepare(`PRAGMA table_info('users')`).all();
+      const hasCanDm = userColumns?.results?.some((col) => col?.name === "can_dm");
+      if (!hasCanDm) {
+        await db.prepare(`ALTER TABLE users ADD COLUMN can_dm INTEGER NOT NULL DEFAULT 1`).run();
+      }
       await db.prepare(
         `CREATE TABLE IF NOT EXISTS vip_members (
           user_id INTEGER PRIMARY KEY,
