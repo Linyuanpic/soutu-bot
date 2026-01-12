@@ -4,12 +4,12 @@ compatibility_date = "2024-05-01"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "YOUR_KV_ID"
+id = "soutu-bot"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "soutu-db"
-database_id = "YOUR_D1_ID"
+database_name = "soutu-bot"
+database_id = "bca36663-b43f-426c-972e-fcece7125987"
 
 [vars]
 TZ = "Asia/Shanghai"
