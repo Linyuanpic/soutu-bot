@@ -29,6 +29,10 @@ export const IMAGE_PROXY_CACHE_TTL_SEC = 7 * 24 * 3600;
 export const IMAGE_PROXY_RATE_LIMIT = 3;
 export const IMAGE_PROXY_RATE_WINDOW = 60;
 export const FILE_PATH_CACHE_TTL = 7 * 24 * 3600;
+export const DAILY_SEARCH_RESET_HOUR = 8;
+export const DAILY_SEARCH_LIMIT_NONMEMBER = 3;
+export const DAILY_SEARCH_LIMIT_MEMBER = 300;
+export const GROUP_MEMBER_EXPIRE_DAYS = 36500;
 export const WEEKDAY_INDEX = {
   Sun: 7,
   Mon: 1,

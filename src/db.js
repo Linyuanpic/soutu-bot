@@ -81,3 +81,18 @@ export async function setSetting(env, key, value) {
      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`
   ).bind(key, value, t).run();
 }
+
+export async function upsertManagedChat(env, chat) {
+  const chatId = chat?.id;
+  const chatType = chat?.type;
+  if (!Number.isFinite(chatId)) return;
+  if (!["group", "supergroup", "channel"].includes(chatType)) return;
+  const normalizedType = chatType === "supergroup" ? "group" : chatType;
+  const title = chat?.title || chat?.username || "";
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO managed_chats(chat_id, chat_type, title, is_enabled, created_at)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type, title=excluded.title, is_enabled=1`
+  ).bind(chatId, normalizedType, title, 1, t).run();
+}

@@ -1,4 +1,7 @@
 import {
+  DAILY_SEARCH_LIMIT_MEMBER,
+  DAILY_SEARCH_LIMIT_NONMEMBER,
+  DAILY_SEARCH_RESET_HOUR,
   FILE_PATH_CACHE_TTL,
   IMAGE_PROXY_PREFIX,
   IMAGE_PROXY_RATE_LIMIT,
@@ -9,7 +12,7 @@ import {
 } from "./config.js";
 import { getKv } from "./kv.js";
 import { tgCall } from "./telegram.js";
-import { nowSec, normalizeBaseUrl, toBase64Url, getTzDateKey } from "./utils.js";
+import { nowSec, normalizeBaseUrl, toBase64Url, getTzDateKey, getTzDateKeyWithOffset } from "./utils.js";
 
 let proxySigningKeyPromise;
 
@@ -124,6 +127,29 @@ export async function recordDailyImageStats(env, userId) {
     const userTotal = Number(await kv.get(userTotalKey) || 0);
     await kv.put(userTotalKey, String(userTotal + 1), { expirationTtl: 40 * 86400 });
   }
+}
+
+function getSearchDayKey(env) {
+  return getTzDateKeyWithOffset(nowSec(), env.TZ, DAILY_SEARCH_RESET_HOUR);
+}
+
+export async function getDailySearchStatus(env, userId, isMember) {
+  if (!userId) return { allowed: false, current: 0, limit: 0 };
+  const limit = isMember ? DAILY_SEARCH_LIMIT_MEMBER : DAILY_SEARCH_LIMIT_NONMEMBER;
+  const dayKey = getSearchDayKey(env);
+  const key = `image_search:${dayKey}:${userId}`;
+  const kv = getKv(env);
+  const current = Number(await kv.get(key) || 0);
+  return { allowed: current < limit, current, limit };
+}
+
+export async function recordDailySearchCount(env, userId) {
+  if (!userId) return;
+  const dayKey = getSearchDayKey(env);
+  const key = `image_search:${dayKey}:${userId}`;
+  const kv = getKv(env);
+  const current = Number(await kv.get(key) || 0);
+  await kv.put(key, String(current + 1), { expirationTtl: 3 * 86400 });
 }
 
 export async function shouldNotifyVideoWarning(env, userId) {

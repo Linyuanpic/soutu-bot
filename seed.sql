@@ -1,11 +1,16 @@
 -- START template: You can edit text & buy buttons in admin. Verify/Support buttons are appended by code.
 INSERT OR IGNORE INTO templates (key,title,parse_mode,disable_preview,text,buttons_json,updated_at) VALUES
 ('start','/start 首页','HTML',0,
-'打赏群！欢迎新春！限时优惠！199元一年 年后结束！<a href="https://example.com">加入会员</a>\n\n<b>提示：</b>请先购买卡密，再点下方“验证卡密”。',
+'为了服务能够长期稳定：\n\n普通用户：每日3次免费搜图\n\n会员用户：每日不限次免费搜图\n\n加入下方任一群组，都可获得永久不限次使用机器人哦～',
 '[
   [
-    {"text":"支付宝/微信 购买","type":"url","url":"https://example.com/buy1"},
-    {"text":"支付宝/微信 备用","type":"url","url":"https://example.com/buy2"}
+    {"text":"🎉会员赞助 → 188元🔥永久","type":"url","url":"https://t.me/orzboy_bot?start=bUPHj9WUw0fmYEP"}
+  ],
+  [
+    {"text":"🎉资源合集 → 128元🔥永久","type":"url","url":"https://t.me/orzboy_bot?start=kY7cFpjD0fjsEO0"}
+  ],
+  [
+    {"text":"🎉查找出处 → 38元🔥永久","type":"url","url":"https://t.me/orzboy_bot?start=A9G93w5qiYAspSW"}
   ]
 ]',
 strftime('%s','now')),
