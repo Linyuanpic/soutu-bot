@@ -15,8 +15,6 @@ id = "b55a275566a34c3f81a2903e14af4a19"
 [triggers]
 crons = ["*/5 * * * *"]
 
-routes = ["soutu.linyuan.cc/*"]
-
 [vars]
 # Non-sensitive configuration only. Store BOT_TOKEN as a secret.
 ADMIN_USER_IDS = "7204268059"
