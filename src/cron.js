@@ -1,4 +1,4 @@
-import { getDb, validateEnv } from "./db.js";
+import { ensureSchema, getDb, validateEnv } from "./db.js";
 import { sendTemplate } from "./telegram.js";
 import { nowSec } from "./utils.js";
 
@@ -82,5 +82,6 @@ async function processBroadcastJobs(env) {
 export async function scheduled(event, env, ctx) {
   const envIssues = validateEnv(env);
   if (envIssues.length) return;
+  await ensureSchema(env);
   ctx.waitUntil(processBroadcastJobs(env));
 }

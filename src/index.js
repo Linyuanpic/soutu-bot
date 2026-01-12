@@ -1,5 +1,5 @@
 import { JSON_HEADERS, IMAGE_PROXY_PREFIX } from "./config.js";
-import { validateEnv } from "./db.js";
+import { ensureSchema, validateEnv } from "./db.js";
 import { handleBingImagesRequest, handleImageProxyRequest } from "./image.js";
 import {
   adminApi,
@@ -18,6 +18,7 @@ export default {
     if (envIssues.length) {
       return new Response(JSON.stringify({ ok: false, error: envIssues.join(" ") }), { status: 500, headers: JSON_HEADERS });
     }
+    await ensureSchema(env);
     const url = new URL(req.url);
     const path = url.pathname;
 
