@@ -4,7 +4,7 @@ compatibility_date = "2026-01-02"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "soutu-bot"
+id = "YOUR_KV_ID"
 
 [[d1_databases]]
 binding = "DB"
