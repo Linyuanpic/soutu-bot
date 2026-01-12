@@ -4,7 +4,7 @@ compatibility_date = "2026-01-02"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "b55a275566a34c3f81a2903e14af4a1"
+id = "b55a275566a34c3f81a2903e14af4a19"
 
 [[d1_databases]]
 binding = "DB"
