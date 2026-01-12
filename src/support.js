@@ -1761,7 +1761,11 @@ export async function handleWebhook(env, update, requestUrl) {
       return;
     }
     try {
-      await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
+      try {
+        await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
+      } catch (e) {
+        console.warn("[tg] getFile failed, continue to reply:", e?.message || String(e));
+      }
       const imageUrl = await buildSignedProxyUrl(env, requestUrlString, imageInfo.fileId, userId);
       const links = buildImageSearchLinks(imageUrl);
       const tpl = await getTemplate(env, IMAGE_REPLY_TEMPLATE_KEY);
@@ -1775,14 +1779,19 @@ export async function handleWebhook(env, update, requestUrl) {
         google_lens: links.google,
         yandex: links.yandex
       });
-      await trySendMessage(env, userId, {
+      const basePayload = {
         chat_id: userId,
         text: replyText,
         parse_mode: tpl?.parse_mode || "HTML",
         disable_web_page_preview: tpl ? tpl.disable_preview : true,
         reply_markup: replyButtons.length ? buildKeyboard(replyButtons) : undefined,
-        reply_to_message_id: msg.message_id
-      });
+      };
+      try {
+        await trySendMessage(env, userId, { ...basePayload, reply_to_message_id: msg.message_id });
+      } catch (e) {
+        console.warn("[tg] reply with message_id failed, retrying without reply:", e?.message || String(e));
+        await trySendMessage(env, userId, basePayload);
+      }
     } catch {
       await tgCall(env, "sendMessage", { chat_id: userId, text: "图片处理失败，请稍后再试。" });
     }
