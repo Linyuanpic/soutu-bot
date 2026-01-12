@@ -1,0 +1,22 @@
+name = "telegram-bot"
+main = "src/index.js"
+compatibility_date = "2026-01-10"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "telegram-bot"
+database_id = "eeddd9c9-7db3-4eb4-bb94-b4b311b258ec"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "61884290f78648e6b004363952a3cdb2"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+# Non-sensitive configuration only. Store BOT_TOKEN as a secret.
+ADMIN_USER_IDS = "7204268059"
+TZ = "Asia/Shanghai"
+
+# You will set secrets via: wrangler secret put BOT_TOKEN
