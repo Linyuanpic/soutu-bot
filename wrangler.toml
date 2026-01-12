@@ -1,6 +1,6 @@
 name = "soutu-bot"
 main = "src/index.js"
-compatibility_date = "2026-01-01"
+compatibility_date = "2026-01-02"
 
 [[kv_namespaces]]
 binding = "KV"
