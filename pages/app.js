@@ -1,4 +1,4 @@
-c onst adminToken = localStorage.getItem("admin_token") || "";
+const adminToken = localStorage.getItem("admin_token") || "";
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
