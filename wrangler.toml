@@ -1,6 +1,7 @@
 name = "soutu-bot"
 main = "src/index.js"
 compatibility_date = "2026-01-10"
+workers_dev = true
 
 [[d1_databases]]
 binding = "DB"
@@ -14,12 +15,11 @@ id = "b55a275566a34c3f81a2903e14af4a19"
 [triggers]
 crons = ["*/5 * * * *"]
 
+routes = ["soutu.linyuan.cc/*"]
+
 [vars]
 # Non-sensitive configuration only. Store BOT_TOKEN as a secret.
 ADMIN_USER_IDS = "7204268059"
 TZ = "Asia/Shanghai"
 
-[[routes]]
-# Custom domain route
-pattern = "soutu.linyuan.cc/*"
-zone_name = "linyuan.cc"
+# You will set secrets via: wrangler secret put BOT_TOKEN

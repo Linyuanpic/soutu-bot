@@ -9,8 +9,8 @@ import {
   IMAGE_PROXY_TTL_SEC,
   JSON_HEADERS,
 } from "./config.js";
-import { isMember } from "./auth.js";
 import { getKv } from "./kv.js";
+import { isMember } from "./auth.js";
 import { tgCall } from "./telegram.js";
 import { nowSec, normalizeBaseUrl, toBase64Url, getTzDateKey } from "./utils.js";
 
@@ -215,7 +215,6 @@ export async function handleImageProxyRequest(env, req, url) {
   const payload = signedParams.toString();
   const expected = await signProxyPayload(env, payload);
   if (sig !== expected) return new Response("Forbidden", { status: 403 });
-  if (exp < nowSec()) return new Response("Expired", { status: 403 });
 
   const cache = caches.default;
   const cacheKeyUrl = new URL(url.origin + IMAGE_PROXY_PREFIX);
@@ -223,6 +222,8 @@ export async function handleImageProxyRequest(env, req, url) {
   const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
   const cached = await cache.match(cacheKey);
   if (cached) return cached;
+
+  if (exp < nowSec()) return new Response("Expired", { status: 403 });
 
   const tokenData = await readProxyToken(env, token);
   if (!tokenData || tokenData.fileId !== fileId) return new Response("Forbidden", { status: 403 });

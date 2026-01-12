@@ -65,14 +65,12 @@ export async function trySendMessage(env, chatId, payload) {
 }
 
 export async function ensureBotCommands(env) {
-  const key = "bot_commands_set_v2";
+  const key = "bot_commands_set";
   const kv = getKv(env);
   if (await kv.get(key)) return;
   try {
     await tgCall(env, "setMyCommands", {
-      commands: [
-        { command: "start", description: "开始 - 打开首页" }
-      ],
+      commands: [{ command: "start", description: "开始 - 打开首页" }],
       scope: { type: "all_private_chats" }
     });
     await kv.put(key, "1", { expirationTtl: 86400 });
