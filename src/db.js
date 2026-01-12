@@ -53,6 +53,11 @@ export async function ensureSchema(env) {
           created_at INTEGER NOT NULL
         )`
       ).run();
+      const managedChatColumns = await db.prepare(`PRAGMA table_info('managed_chats')`).all();
+      const hasManagedChatTitle = managedChatColumns?.results?.some((col) => col?.name === "title");
+      if (!hasManagedChatTitle) {
+        await db.prepare(`ALTER TABLE managed_chats ADD COLUMN title TEXT`).run();
+      }
       await db.prepare(
         `CREATE TABLE IF NOT EXISTS templates (
           key TEXT PRIMARY KEY,
@@ -64,6 +69,11 @@ export async function ensureSchema(env) {
           updated_at INTEGER NOT NULL
         )`
       ).run();
+      const templateColumns = await db.prepare(`PRAGMA table_info('templates')`).all();
+      const hasTemplateTitle = templateColumns?.results?.some((col) => col?.name === "title");
+      if (!hasTemplateTitle) {
+        await db.prepare(`ALTER TABLE templates ADD COLUMN title TEXT`).run();
+      }
       await db.prepare(
         `CREATE TABLE IF NOT EXISTS broadcast_jobs (
           job_id TEXT PRIMARY KEY,
