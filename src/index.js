@@ -1,5 +1,5 @@
 import { JSON_HEADERS, IMAGE_PROXY_PREFIX } from "./config.js";
-import { handleAdminApi } from "./admin/index.js";
+import { adminHtml, consumeAdminLoginToken, createAdminSession, handleAdminApi, isAdminSession, loginHtml } from "./admin/index.js";
 import { handleWebhook } from "./bot/index.js";
 import { handleImageProxyRequest } from "./search/index.js";
 
@@ -24,7 +24,29 @@ export default {
       return handleImageProxyRequest(env, req, url);
     }
 
-    if (path.startsWith("/admin/")) {
+    if (path === "/admin" || path === "/") {
+      const token = url.searchParams.get("token");
+      if (token) {
+        const userId = await consumeAdminLoginToken(env, token);
+        if (userId) {
+          const sessionToken = await createAdminSession(env, userId);
+          return new Response("", {
+            status: 302,
+            headers: {
+              Location: "/admin#dashboard",
+              "set-cookie": `admin_session=${sessionToken}; Path=/; Secure; HttpOnly; SameSite=None; Max-Age=${7 * 24 * 3600}`,
+            },
+          });
+        }
+      }
+      const userId = await isAdminSession(env, req);
+      if (userId) {
+        return new Response(adminHtml(), { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      return new Response(loginHtml(), { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
+
+    if (path.startsWith("/api/admin/")) {
       return handleAdminApi(env, req, path);
     }
 
