@@ -74,6 +74,18 @@ export async function ensureSchema(env) {
       if (!hasTemplateTitle) {
         await db.prepare(`ALTER TABLE templates ADD COLUMN title TEXT`).run();
       }
+      const hasTemplateParseMode = templateColumns?.results?.some((col) => col?.name === "parse_mode");
+      if (!hasTemplateParseMode) {
+        await db.prepare(`ALTER TABLE templates ADD COLUMN parse_mode TEXT NOT NULL DEFAULT 'HTML'`).run();
+      }
+      const hasTemplateDisablePreview = templateColumns?.results?.some((col) => col?.name === "disable_preview");
+      if (!hasTemplateDisablePreview) {
+        await db.prepare(`ALTER TABLE templates ADD COLUMN disable_preview INTEGER NOT NULL DEFAULT 0`).run();
+      }
+      const hasTemplateButtonsJson = templateColumns?.results?.some((col) => col?.name === "buttons_json");
+      if (!hasTemplateButtonsJson) {
+        await db.prepare(`ALTER TABLE templates ADD COLUMN buttons_json TEXT NOT NULL DEFAULT '[]'`).run();
+      }
       await db.prepare(
         `CREATE TABLE IF NOT EXISTS broadcast_jobs (
           job_id TEXT PRIMARY KEY,
