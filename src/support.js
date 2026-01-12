@@ -127,6 +127,8 @@ export async function checkSpamAndMaybeClose(env, userId) {
 
 const MEDIA_GROUP_BUFFER_MS = 500;
 const mediaGroupBuffers = new Map();
+const SEARCH_MEDIA_GROUP_BUFFER_MS = 500;
+const searchMediaGroupBuffers = new Map();
 
 function buildMediaGroupItem(msg, includeCaption) {
   if (!msg) return null;
@@ -216,6 +218,98 @@ function bufferSupportMediaGroup(env, msg) {
       entry.resolve?.();
     }
   }, MEDIA_GROUP_BUFFER_MS);
+  return entry.promise;
+}
+
+async function handleImageOrVideoMessage(env, msg, requestUrlString) {
+  const userId = msg.from?.id;
+  if (!Number.isFinite(userId)) return false;
+  if (isVideoMessage(msg)) {
+    if (await shouldNotifyVideoWarning(env, userId)) {
+      await recordDailyImageReminder(env, userId);
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "本机器人只支持图片搜索哦～" });
+    }
+    return true;
+  }
+
+  const imageInfo = getMessageImageInfo(msg);
+  if (!imageInfo) return false;
+  const limitCheck = await checkDailyImageLimit(env, userId);
+  if (!limitCheck.allowed) {
+    const tierKey = limitCheck.member ? "member" : "nonmember";
+    if (await shouldNotifyImageLimit(env, userId, tierKey)) {
+      const templateKey = limitCheck.member ? IMAGE_LIMIT_MEMBER_TEMPLATE_KEY : IMAGE_LIMIT_NONMEMBER_TEMPLATE_KEY;
+      const limitTpl = await getTemplate(env, templateKey) || await getTemplate(env, "image_limit");
+      if (limitTpl) {
+        await sendTemplate(env, userId, limitTpl.key);
+      } else if (limitCheck.member) {
+        await tgCall(env, "sendMessage", { chat_id: userId, text: "谢谢您的支持，为防止机器人被人恶意爆刷，请于明天再来尝试搜索哦～" });
+      } else {
+        await tgCall(env, "sendMessage", { chat_id: userId, text: "为了能长期运营下去，普通用户每日搜图上限为5张，想要尽情搜索，就请加入打赏群哦～" });
+      }
+    }
+    return true;
+  }
+  try {
+    await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
+    const imageUrl = await buildSignedProxyUrl(env, requestUrlString, imageInfo.fileId, userId);
+    const links = buildImageSearchLinks(imageUrl);
+    const tpl = await getTemplate(env, IMAGE_REPLY_TEMPLATE_KEY);
+    const replyText = normalizeTelegramHtml(renderTemplateText(tpl?.text || IMAGE_REPLY_DEFAULT_TEXT, {
+      image_url: imageUrl,
+      google_lens: links.google,
+      yandex: links.yandex
+    }));
+    const replyButtons = renderButtonsWithVars(tpl?.buttons?.length ? tpl.buttons : IMAGE_REPLY_DEFAULT_BUTTONS, {
+      image_url: imageUrl,
+      google_lens: links.google,
+      yandex: links.yandex
+    });
+    await trySendMessage(env, userId, {
+      chat_id: userId,
+      text: replyText,
+      parse_mode: tpl?.parse_mode || "HTML",
+      disable_web_page_preview: tpl ? tpl.disable_preview : true,
+      reply_markup: replyButtons.length ? buildKeyboard(replyButtons) : undefined,
+      reply_to_message_id: msg.message_id
+    });
+  } catch (e) {
+    await tgCall(env, "sendMessage", { chat_id: userId, text: "图片处理失败，请稍后再试。" });
+  }
+  return true;
+}
+
+function bufferSearchMediaGroup(env, msg, requestUrlString) {
+  const groupId = msg.media_group_id;
+  if (!groupId) return Promise.resolve(false);
+  let entry = searchMediaGroupBuffers.get(groupId);
+  if (!entry) {
+    entry = { messages: [], timer: null, promise: null, resolve: null, userId: msg.from?.id };
+    entry.promise = new Promise((resolve) => {
+      entry.resolve = resolve;
+    });
+    searchMediaGroupBuffers.set(groupId, entry);
+  }
+  if (!entry.userId) entry.userId = msg.from?.id;
+  entry.messages.push(msg);
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(async () => {
+    const currentEntry = searchMediaGroupBuffers.get(groupId);
+    if (!currentEntry) return;
+    searchMediaGroupBuffers.delete(groupId);
+    const messages = currentEntry.messages.slice().sort((a, b) => (a.message_id || 0) - (b.message_id || 0));
+    if (messages.length === 1) {
+      const handled = await handleImageOrVideoMessage(env, messages[0], requestUrlString);
+      currentEntry.resolve?.(handled);
+      return;
+    }
+    const userId = currentEntry.userId;
+    if (Number.isFinite(userId) && await shouldNotifyMediaGroup(env, userId, groupId)) {
+      await recordDailyImageReminder(env, userId);
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "请发送一张图片进行搜索哦～" });
+    }
+    currentEntry.resolve?.(true);
+  }, SEARCH_MEDIA_GROUP_BUFFER_MS);
   return entry.promise;
 }
 
@@ -2882,65 +2976,12 @@ export async function handleWebhook(env, update, requestUrl) {
   }
 
   if (msg.media_group_id) {
-    if (await shouldNotifyMediaGroup(env, userId, msg.media_group_id)) {
-      await recordDailyImageReminder(env, userId);
-      await tgCall(env, "sendMessage", { chat_id: userId, text: "请发送一张图片进行搜索哦～" });
-    }
-    return;
-  }
-
-  if (isVideoMessage(msg)) {
-    if (await shouldNotifyVideoWarning(env, userId)) {
-      await recordDailyImageReminder(env, userId);
-      await tgCall(env, "sendMessage", { chat_id: userId, text: "本机器人只支持图片搜索哦～" });
-    }
-    return;
-  }
-
-  const imageInfo = getMessageImageInfo(msg);
-  if (imageInfo) {
-    const limitCheck = await checkDailyImageLimit(env, userId);
-    if (!limitCheck.allowed) {
-      const tierKey = limitCheck.member ? "member" : "nonmember";
-      if (await shouldNotifyImageLimit(env, userId, tierKey)) {
-        const templateKey = limitCheck.member ? IMAGE_LIMIT_MEMBER_TEMPLATE_KEY : IMAGE_LIMIT_NONMEMBER_TEMPLATE_KEY;
-        const limitTpl = await getTemplate(env, templateKey) || await getTemplate(env, "image_limit");
-        if (limitTpl) {
-          await sendTemplate(env, userId, limitTpl.key);
-        } else if (limitCheck.member) {
-          await tgCall(env, "sendMessage", { chat_id: userId, text: "谢谢您的支持，为防止机器人被人恶意爆刷，请于明天再来尝试搜索哦～" });
-        } else {
-          await tgCall(env, "sendMessage", { chat_id: userId, text: "为了能长期运营下去，普通用户每日搜图上限为5张，想要尽情搜索，就请加入打赏群哦～" });
-        }
-      }
+    if (await bufferSearchMediaGroup(env, msg, requestUrlString)) {
       return;
     }
-    try {
-      await getTelegramFilePath(env, imageInfo.fileId, imageInfo.fileUniqueId);
-      const imageUrl = await buildSignedProxyUrl(env, requestUrlString, imageInfo.fileId, userId);
-      const links = buildImageSearchLinks(imageUrl);
-      const tpl = await getTemplate(env, IMAGE_REPLY_TEMPLATE_KEY);
-      const replyText = normalizeTelegramHtml(renderTemplateText(tpl?.text || IMAGE_REPLY_DEFAULT_TEXT, {
-        image_url: imageUrl,
-        google_lens: links.google,
-        yandex: links.yandex
-      }));
-      const replyButtons = renderButtonsWithVars(tpl?.buttons?.length ? tpl.buttons : IMAGE_REPLY_DEFAULT_BUTTONS, {
-        image_url: imageUrl,
-        google_lens: links.google,
-        yandex: links.yandex
-      });
-      await trySendMessage(env, userId, {
-        chat_id: userId,
-        text: replyText,
-        parse_mode: tpl?.parse_mode || "HTML",
-        disable_web_page_preview: tpl ? tpl.disable_preview : true,
-        reply_markup: replyButtons.length ? buildKeyboard(replyButtons) : undefined,
-        reply_to_message_id: msg.message_id
-      });
-    } catch (e) {
-      await tgCall(env, "sendMessage", { chat_id: userId, text: "图片处理失败，请稍后再试。" });
-    }
+  }
+
+  if (await handleImageOrVideoMessage(env, msg, requestUrlString)) {
     return;
   }
 
