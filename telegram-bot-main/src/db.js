@@ -43,9 +43,14 @@ export async function setCanDm(env, userId, canDm) {
   await getDb(env).prepare(`UPDATE users SET can_dm=?, last_seen_at=? WHERE user_id=?`).bind(canDm ? 1 : 0, t, userId).run();
 }
 
-export async function getMembership(env, userId) {
-  const row = await getDb(env).prepare(`SELECT user_id, verified_at, expire_at FROM memberships WHERE user_id=?`).bind(userId).first();
-  return row || null;
+export async function recordVipMember(env, userId) {
+  if (!Number.isFinite(userId)) return;
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO vip_members(user_id, first_seen_at, last_seen_at)
+     VALUES (?,?,?)
+     ON CONFLICT(user_id) DO UPDATE SET last_seen_at=excluded.last_seen_at`
+  ).bind(userId, t, t).run();
 }
 
 export async function getTemplate(env, key) {
