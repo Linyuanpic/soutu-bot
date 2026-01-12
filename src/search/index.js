@@ -6,6 +6,7 @@ import {
   IMAGE_PROXY_RATE_WINDOW,
   IMAGE_PROXY_TTL_SEC,
 } from "../config.js";
+import { kvGet, kvPut } from "../storage/kv.js";
 import { tgCall } from "../telegram.js";
 import { normalizeBaseUrl, nowSec, toBase64Url } from "../utils.js";
 
@@ -40,12 +41,12 @@ function generateOpaqueToken() {
 
 async function storeProxyToken(env, token, fileId, userId) {
   const payload = JSON.stringify({ fileId, userId });
-  await env.KV.put(`image_token:${token}`, payload, { expirationTtl: IMAGE_PROXY_TTL_SEC });
+  await kvPut(env, `image_token:${token}`, payload, { expirationTtl: IMAGE_PROXY_TTL_SEC });
 }
 
 async function readProxyToken(env, token) {
   if (!token) return null;
-  const raw = await env.KV.get(`image_token:${token}`);
+  const raw = await kvGet(env, `image_token:${token}`);
   if (!raw) return null;
   try {
     return JSON.parse(raw);
@@ -70,9 +71,9 @@ export async function buildSignedProxyUrl(env, requestUrl, fileId, userId) {
 
 export async function getTelegramFilePath(env, fileId, fileUniqueId) {
   const fileKey = `tg:file:${fileId}`;
-  let filePath = await env.KV.get(fileKey);
+  let filePath = await kvGet(env, fileKey);
   if (!filePath && fileUniqueId) {
-    filePath = await env.KV.get(`tg:unique:${fileUniqueId}`);
+    filePath = await kvGet(env, `tg:unique:${fileUniqueId}`);
   }
   if (!filePath) {
     const file = await tgCall(env, "getFile", { file_id: fileId });
@@ -80,18 +81,18 @@ export async function getTelegramFilePath(env, fileId, fileUniqueId) {
     filePath = file.file_path;
   }
   if (filePath) {
-    await env.KV.put(fileKey, filePath, { expirationTtl: FILE_PATH_CACHE_TTL });
+    await kvPut(env, fileKey, filePath, { expirationTtl: FILE_PATH_CACHE_TTL });
     if (fileUniqueId) {
-      await env.KV.put(`tg:unique:${fileUniqueId}`, filePath, { expirationTtl: FILE_PATH_CACHE_TTL });
+      await kvPut(env, `tg:unique:${fileUniqueId}`, filePath, { expirationTtl: FILE_PATH_CACHE_TTL });
     }
   }
   return filePath;
 }
 
 async function bumpRateLimit(env, key, limit, ttlSec) {
-  const current = Number(await env.KV.get(key) || 0);
+  const current = Number(await kvGet(env, key) || 0);
   if (current >= limit) return false;
-  await env.KV.put(key, String(current + 1), { expirationTtl: ttlSec });
+  await kvPut(env, key, String(current + 1), { expirationTtl: ttlSec });
   return true;
 }
 

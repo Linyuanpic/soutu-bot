@@ -40,3 +40,11 @@ CREATE TABLE IF NOT EXISTS admins (
   user_id INTEGER PRIMARY KEY,
   role TEXT
 );
+
+CREATE TABLE IF NOT EXISTS kv_store (
+  key TEXT PRIMARY KEY,
+  value TEXT,
+  expires_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS kv_store_expires_at_idx ON kv_store (expires_at);

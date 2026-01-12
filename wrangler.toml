@@ -2,10 +2,6 @@ name = "soutu-bot"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-[[kv_namespaces]]
-binding = "KV"
-id = "soutu-bot"
-
 [[d1_databases]]
 binding = "DB"
 database_name = "soutu-bot"

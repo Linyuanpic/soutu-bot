@@ -1,4 +1,5 @@
 import { GROUP_DAILY_LIMIT, PRIVATE_DAILY_LIMIT } from "../config.js";
+import { kvGet, kvPut } from "../storage/kv.js";
 import { getTzDateKey, nowSec } from "../utils.js";
 
 function buildKey(prefix, userId, tz) {
@@ -7,10 +8,10 @@ function buildKey(prefix, userId, tz) {
 }
 
 async function bumpQuota(env, key, limit, ttlSec) {
-  const current = Number(await env.KV.get(key) || 0);
+  const current = Number(await kvGet(env, key) || 0);
   if (current >= limit) return { allowed: false, current, limit };
   const next = current + 1;
-  await env.KV.put(key, String(next), { expirationTtl: ttlSec });
+  await kvPut(env, key, String(next), { expirationTtl: ttlSec });
   return { allowed: true, current: next, limit };
 }
 
