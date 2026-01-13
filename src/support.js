@@ -30,7 +30,7 @@ import {
   shouldNotifyMediaGroup,
   shouldNotifyVideoWarning,
 } from "./image.js";
-import { ensureMembershipThrough, isMember } from "./auth.js";
+import { ensureMembershipThrough, isMember, updateVipListCache } from "./auth.js";
 import { ensureBotCommands, tgCall, trySendMessage } from "./telegram.js";
 import {
   appendFixedStartButtons,
@@ -109,7 +109,9 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
   const member = await isMember(env, userId);
   const searchStatus = await getDailySearchStatus(env, userId, member);
   if (!searchStatus.allowed) {
-    if (await shouldNotifyDailyLimit(env, userId)) {
+    if (member) {
+      await tgCall(env, "sendMessage", { chat_id: userId, text: "服务器繁忙，请稍候再试。" });
+    } else if (await shouldNotifyDailyLimit(env, userId)) {
       await sendStartTemplate(env, userId);
     }
     return true;
@@ -1879,6 +1881,7 @@ export async function adminApi(env, req, pathname) {
        VALUES (?,?,?,?)
        ON CONFLICT(user_id) DO UPDATE SET expire_at=excluded.expire_at, updated_at=excluded.updated_at`
     ).bind(targetId, t, expireAt, t).run();
+    await updateVipListCache(env, targetId, true);
     return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
@@ -1945,6 +1948,7 @@ export async function adminApi(env, req, pathname) {
        VALUES (?,?,?,?)
        ON CONFLICT(user_id) DO UPDATE SET expire_at=excluded.expire_at, updated_at=excluded.updated_at`
     ).bind(targetId, t, expireAt, t).run();
+    await updateVipListCache(env, targetId, true);
     return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
@@ -1952,6 +1956,7 @@ export async function adminApi(env, req, pathname) {
     const targetId = Number(decodeURIComponent(pathname.split("/").pop()));
     if (!Number.isFinite(targetId)) return new Response(JSON.stringify({ ok:false, error:"用户ID无效" }), { status: 400, headers: JSON_HEADERS });
     await getDb(env).prepare(`DELETE FROM memberships WHERE user_id=?`).bind(targetId).run();
+    await updateVipListCache(env, targetId, false);
     return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 

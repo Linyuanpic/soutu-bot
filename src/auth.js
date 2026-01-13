@@ -1,48 +1,79 @@
+import { DAILY_SEARCH_RESET_HOUR } from "./config.js";
 import { getDb, getMembership } from "./db.js";
 import { getKv } from "./kv.js";
-import { nowSec, getTzDayStart, getTzDateKey } from "./utils.js";
+import { nowSec, getTzDateKey, getTzDateKeyWithOffset } from "./utils.js";
 
-function getVipCacheKey(userId) {
-  return `vip_cache:${userId}`;
+function getVipListDayKey(env) {
+  return getTzDateKeyWithOffset(nowSec(), env.TZ, DAILY_SEARCH_RESET_HOUR);
 }
 
-function getVipCacheTtl(env, expireAt) {
-  const now = nowSec();
-  if (expireAt && expireAt > now) {
-    return Math.max(60, expireAt - now);
-  }
-  const tz = env.TZ || "Asia/Shanghai";
-  const nextDayStart = getTzDayStart(now + 86400, tz);
-  return Math.max(3600, nextDayStart - now + 3600);
+function getVipListCacheKey(dayKey) {
+  return `vip_list:${dayKey}`;
 }
 
-export async function setVipCache(env, userId, expireAt) {
+async function readVipListCache(env, dayKey) {
   const kv = getKv(env);
-  if (!kv || !Number.isFinite(userId)) return;
-  if (expireAt && expireAt > nowSec()) {
-    await kv.put(getVipCacheKey(userId), String(expireAt), { expirationTtl: getVipCacheTtl(env, expireAt) });
-  } else {
-    await kv.put(getVipCacheKey(userId), "0", { expirationTtl: getVipCacheTtl(env, null) });
+  if (!kv) return null;
+  const raw = await kv.get(getVipListCacheKey(dayKey));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed;
+    return null;
+  } catch {
+    return null;
   }
+}
+
+async function writeVipListCache(env, dayKey, list) {
+  const kv = getKv(env);
+  if (!kv) return;
+  await kv.put(getVipListCacheKey(dayKey), JSON.stringify(list), { expirationTtl: 24 * 86400 });
+}
+
+async function fetchVipList(env) {
+  const rows = await getDb(env).prepare(
+    `SELECT user_id FROM memberships WHERE expire_at > ?`
+  ).bind(nowSec()).all();
+  return (rows.results || []).map(row => Number(row.user_id)).filter(Number.isFinite);
+}
+
+async function ensureVipListCache(env) {
+  const kv = getKv(env);
+  if (!kv) return null;
+  const dayKey = getVipListDayKey(env);
+  const cached = await readVipListCache(env, dayKey);
+  if (cached) return { dayKey, list: cached };
+  const list = await fetchVipList(env);
+  await writeVipListCache(env, dayKey, list);
+  return { dayKey, list };
+}
+
+export async function updateVipListCache(env, userId, isMember) {
+  if (!Number.isFinite(userId)) return;
+  const kv = getKv(env);
+  if (!kv) return;
+  const result = await ensureVipListCache(env);
+  if (!result) return;
+  const { dayKey, list } = result;
+  const set = new Set(list);
+  if (isMember) {
+    set.add(userId);
+  } else {
+    set.delete(userId);
+  }
+  await writeVipListCache(env, dayKey, Array.from(set));
 }
 
 export async function isMember(env, userId) {
+  if (!Number.isFinite(userId)) return false;
   const kv = getKv(env);
-  const cached = kv ? await kv.get(getVipCacheKey(userId)) : null;
-  if (cached === "0") return false;
-  if (cached) {
-    const exp = Number(cached);
-    if (Number.isFinite(exp)) {
-      if (exp > nowSec()) return true;
-      await setVipCache(env, userId, null);
-      return false;
-    }
-    if (cached === "1") return true;
+  if (kv) {
+    const cached = await ensureVipListCache(env);
+    if (cached?.list) return cached.list.includes(userId);
   }
   const m = await getMembership(env, userId);
-  const isActive = !!(m && m.expire_at > nowSec());
-  await setVipCache(env, userId, isActive ? m.expire_at : null);
-  return isActive;
+  return !!(m && m.expire_at > nowSec());
 }
 
 export async function addMembershipDays(env, userId, days) {
@@ -56,7 +87,7 @@ export async function addMembershipDays(env, userId, days) {
     await getDb(env).prepare(`INSERT INTO memberships(user_id, verified_at, expire_at, updated_at) VALUES (?,?,?,?)`)
       .bind(userId, t, expire, t).run();
   }
-  await setVipCache(env, userId, expire);
+  await updateVipListCache(env, userId, true);
   await getDb(env).prepare(`DELETE FROM expired_users WHERE user_id=?`).bind(userId).run();
   return { wasMember: !!(m && m.expire_at > t), expire_at: expire };
 }
@@ -73,7 +104,7 @@ export async function ensureMembershipThrough(env, userId, expireAt) {
     await getDb(env).prepare(`INSERT INTO memberships(user_id, verified_at, expire_at, updated_at) VALUES (?,?,?,?)`)
       .bind(userId, t, targetExpire, t).run();
   }
-  await setVipCache(env, userId, targetExpire);
+  await updateVipListCache(env, userId, true);
   await getDb(env).prepare(`DELETE FROM expired_users WHERE user_id=?`).bind(userId).run();
   return { updated: true, expire_at: targetExpire };
 }
@@ -93,16 +124,11 @@ export async function checkDailyDmLimit(env, userId, isAdmin) {
 export async function syncVipCache(env) {
   const kv = getKv(env);
   if (!kv) return;
-  const tz = env.TZ || "Asia/Shanghai";
-  const dayKey = getTzDateKey(nowSec(), tz);
-  const syncKey = `vip_cache_sync:${dayKey}`;
+  const dayKey = getVipListDayKey(env);
+  const syncKey = `vip_list_sync:${dayKey}`;
   if (await kv.get(syncKey)) return;
-  const rows = await getDb(env).prepare(
-    `SELECT user_id, expire_at FROM memberships WHERE expire_at > ?`
-  ).bind(nowSec()).all();
-  for (const row of (rows.results || [])) {
-    await setVipCache(env, row.user_id, row.expire_at);
-  }
+  const list = await fetchVipList(env);
+  await writeVipListCache(env, dayKey, list);
   await kv.put(syncKey, "1", { expirationTtl: 2 * 86400 });
 }
 
