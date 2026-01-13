@@ -18,14 +18,15 @@ export const TEMPLATE_SORT_ORDER = [
   "exp_after_30d",
 ];
 export const IMAGE_REPLY_TEMPLATE_KEY = "image_reply";
-export const IMAGE_REPLY_DEFAULT_TEXT = "自助搜图，具体内容点击下方按钮～";
+export const IMAGE_REPLY_DEFAULT_TEXT = "搜图结果自行点击下方按钮查看哦～";
 export const IMAGE_REPLY_DEFAULT_BUTTONS = [
   [{ text: "GoogleLens → 看看这是谁", type: "url", url: "{{google_lens}}" }],
-  [{ text: "Yandex.ru → 想找图片来源", type: "url", url: "{{yandex}}" }]
+  [{ text: "Yandex.ru → 想找图片来源", type: "url", url: "{{yandex}}" }],
+  [{ text: "情色百科 → 同人作品搜索", type: "url", url: "https://t.me/+Or5eQlGIEA1mYmM1" }]
 ];
 export const IMAGE_PROXY_PREFIX = "/tgimg";
-export const IMAGE_PROXY_TTL_SEC = 12 * 60 * 60;
-export const IMAGE_PROXY_CACHE_TTL_SEC = 7 * 24 * 3600;
+export const IMAGE_PROXY_TTL_SEC = 60 * 60;
+export const IMAGE_PROXY_CACHE_TTL_SEC = 60 * 60;
 export const IMAGE_PROXY_RATE_LIMIT = 3;
 export const IMAGE_PROXY_RATE_WINDOW = 60;
 export const FILE_PATH_CACHE_TTL = 7 * 24 * 3600;

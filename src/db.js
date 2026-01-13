@@ -96,3 +96,53 @@ export async function upsertManagedChat(env, chat) {
      ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type, title=excluded.title, is_enabled=1`
   ).bind(chatId, normalizedType, title, 1, t).run();
 }
+
+export async function addManagedChat(env, chatId, chatType, title = "", isEnabled = 1) {
+  if (!Number.isFinite(chatId)) return;
+  if (!["group", "supergroup", "channel"].includes(chatType)) return;
+  const normalizedType = chatType === "supergroup" ? "group" : chatType;
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO managed_chats(chat_id, chat_type, title, is_enabled, created_at)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type, title=excluded.title, is_enabled=excluded.is_enabled`
+  ).bind(chatId, normalizedType, title, Number(isEnabled) ? 1 : 0, t).run();
+}
+
+export async function listManagedChats(env, enabledOnly = false) {
+  const where = enabledOnly ? "WHERE is_enabled=1" : "";
+  const rows = await getDb(env).prepare(
+    `SELECT chat_id, chat_type, title, is_enabled, created_at
+     FROM managed_chats
+     ${where}
+     ORDER BY created_at DESC`
+  ).all();
+  return rows.results || [];
+}
+
+export async function isManagedChatEnabled(env, chatId) {
+  if (!Number.isFinite(chatId)) return false;
+  const row = await getDb(env).prepare(`SELECT is_enabled FROM managed_chats WHERE chat_id=?`).bind(chatId).first();
+  return row?.is_enabled === 1;
+}
+
+export async function updateManagedChatStatus(env, chatId, isEnabled) {
+  if (!Number.isFinite(chatId)) return;
+  await getDb(env).prepare(`UPDATE managed_chats SET is_enabled=? WHERE chat_id=?`).bind(Number(isEnabled) ? 1 : 0, chatId).run();
+}
+
+export async function upsertUserChatMembership(env, userId, chatId) {
+  if (!Number.isFinite(userId) || !Number.isFinite(chatId)) return;
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO user_chats(user_id, chat_id, approved_at, removed_at)
+     VALUES (?,?,?,NULL)
+     ON CONFLICT(user_id, chat_id) DO UPDATE SET approved_at=excluded.approved_at, removed_at=NULL`
+  ).bind(userId, chatId, t).run();
+}
+
+export async function markUserChatRemoved(env, userId, chatId) {
+  if (!Number.isFinite(userId) || !Number.isFinite(chatId)) return;
+  const t = nowSec();
+  await getDb(env).prepare(`UPDATE user_chats SET removed_at=? WHERE user_id=? AND chat_id=?`).bind(t, userId, chatId).run();
+}
