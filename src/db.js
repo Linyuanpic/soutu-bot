@@ -1,4 +1,4 @@
-import { DEFAULT_D1_BINDING, DEFAULT_KV_BINDING } from "./config.js";
+import { DEFAULT_D1_BINDING, DEFAULT_KV_BINDING, REQUIRED_MANAGED_CHATS } from "./config.js";
 import { resolveBindingName, nowSec } from "./utils.js";
 import { getKv } from "./kv.js";
 
@@ -36,6 +36,16 @@ export async function ensureUser(env, user) {
      VALUES (?, 1, ?, ?, ?, ?, ?)
      ON CONFLICT(user_id) DO UPDATE SET last_seen_at=excluded.last_seen_at, username=excluded.username, first_name=excluded.first_name, last_name=excluded.last_name`
   ).bind(userId, t, t, username, firstName, lastName).run();
+}
+
+export async function ensureUserById(env, userId) {
+  if (!Number.isFinite(userId)) return;
+  const t = nowSec();
+  await getDb(env).prepare(
+    `INSERT INTO users(user_id, can_dm, first_seen_at, last_seen_at, username, first_name, last_name)
+     VALUES (?, 0, ?, ?, '', '', '')
+     ON CONFLICT(user_id) DO NOTHING`
+  ).bind(userId, t, t).run();
 }
 
 export async function setCanDm(env, userId, canDm) {
@@ -117,11 +127,21 @@ export async function listManagedChats(env, enabledOnly = false) {
      ${where}
      ORDER BY created_at DESC`
   ).all();
-  return rows.results || [];
+  const existing = rows.results || [];
+  const existingIds = new Set(existing.map(row => row.chat_id));
+  const required = REQUIRED_MANAGED_CHATS.map(chat => ({
+    chat_id: chat.chat_id,
+    chat_type: chat.chat_type,
+    title: chat.title,
+    is_enabled: 1,
+    created_at: 0
+  })).filter(chat => !existingIds.has(chat.chat_id));
+  return existing.concat(required);
 }
 
 export async function isManagedChatEnabled(env, chatId) {
   if (!Number.isFinite(chatId)) return false;
+  if (REQUIRED_MANAGED_CHATS.some(chat => chat.chat_id === chatId)) return true;
   const row = await getDb(env).prepare(`SELECT is_enabled FROM managed_chats WHERE chat_id=?`).bind(chatId).first();
   return row?.is_enabled === 1;
 }

@@ -34,6 +34,11 @@ export const DAILY_SEARCH_RESET_HOUR = 8;
 export const DAILY_SEARCH_LIMIT_NONMEMBER = 3;
 export const DAILY_SEARCH_LIMIT_MEMBER = 300;
 export const GROUP_MEMBER_EXPIRE_DAYS = 36500;
+export const REQUIRED_MANAGED_CHATS = [
+  { chat_id: -1002481699111, chat_type: "channel", title: "指定群组/频道" },
+  { chat_id: -1002521546346, chat_type: "channel", title: "指定群组/频道" },
+  { chat_id: -1002460821677, chat_type: "channel", title: "指定群组/频道" },
+];
 export const WEEKDAY_INDEX = {
   Sun: 7,
   Mon: 1,
