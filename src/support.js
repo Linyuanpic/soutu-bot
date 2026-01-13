@@ -9,6 +9,7 @@ import {
 import {
   addManagedChat,
   ensureUser,
+  ensureUserById,
   getDb,
   getTemplate,
   isManagedChatEnabled,
@@ -73,6 +74,7 @@ async function markManagedChatUserAsMember(env, chat, user) {
   const userId = user?.id;
   if (!Number.isFinite(chatId) || !Number.isFinite(userId)) return;
   if (!await isManagedChatEnabled(env, chatId)) return;
+  await upsertManagedChat(env, chat);
   await ensureUser(env, user);
   await upsertUserChatMembership(env, userId, chatId);
   const expireAt = nowSec() + GROUP_MEMBER_EXPIRE_DAYS * 86400;
@@ -289,7 +291,7 @@ export function adminHtml() {
     .wrap{display:flex;min-height:100vh;padding:16px;gap:16px;box-sizing:border-box}
     .side{width:150px;background:#fff;border:1px solid #dbe2ea;border-radius:18px;padding:16px;display:flex;flex-direction:column;gap:14px;box-shadow:0 1px 2px rgba(15,23,42,0.06)}
     .side-header{display:flex;flex-direction:column;gap:4px}
-    .side-title{font-size:18px;font-weight:700;color:#0f172a}
+    .side-title{font-size:18px;font-weight:700;color:#0f172a;text-align:center;width:100%}
     .side-sub{color:#94a3b8;font-size:12px;text-align:center;width:100%}
     .side-nav{display:flex;flex-direction:column;gap:6px}
     .side a{display:flex;align-items:center;justify-content:center;padding:10px 12px;border-radius:10px;color:#1f2937;text-decoration:none;font-weight:500;text-align:center}
@@ -445,13 +447,17 @@ export function adminHtml() {
         <div class="dash-chart-grid">
           <div class="card dash-chart-card">
             <div class="dash-chart-head">
-              <h4>近一周关注机器人用户</h4>
+              <h4>近一周新增用户/会员</h4>
+              <div class="dash-legend">
+                <span><i></i>用户</span>
+                <span><i class="legend-secondary"></i>会员</span>
+              </div>
             </div>
             <div id="dashFollowChart" class="dash-chart"></div>
           </div>
           <div class="card dash-chart-card">
             <div class="dash-chart-head">
-              <h4>近一周发图数量与人数</h4>
+              <h4>近一周搜图数量与人数</h4>
               <div class="dash-legend">
                 <span><i></i>数量</span>
                 <span><i class="legend-secondary"></i>人数</span>
@@ -601,6 +607,19 @@ export function adminHtml() {
             <input id="memberSearch" placeholder="搜索用户昵称 / 用户ID" />
           </div>
         </div>
+        <div class="row" style="margin-top:10px">
+          <div style="flex:1;min-width:220px">
+            <label>新增会员ID</label>
+            <input id="memberAddId" placeholder="输入用户ID" />
+          </div>
+          <div style="width:180px">
+            <label>会员天数</label>
+            <input id="memberAddDays" placeholder="36500" />
+          </div>
+          <div style="width:140px;display:flex;align-items:flex-end">
+            <button id="memberAddBtn">添加会员</button>
+          </div>
+        </div>
         <div id="memberTable"></div>
         <div id="memberPagination" class="pagination"></div>
       </div>
@@ -746,6 +765,8 @@ export function adminHtml() {
       var barHeight = (height - padding * 2) * (series[j].count / max);
       var y = height - padding - barHeight;
       html += '<rect x="' + x + '" y="' + y + '" width="' + barWidth + '" height="' + barHeight + '" fill="' + (color || "#2aabee") + '" rx="3" />';
+      var labelY = Math.max(12, y - 6);
+      html += '<text x="' + (x + barWidth / 2) + '" y="' + labelY + '" fill="#0f172a" font-size="12" text-anchor="middle">' + series[j].count + '</text>';
       html += '<text x="' + (x + barWidth / 2) + '" y="' + (height - 8) + '" fill="#94a3b8" font-size="12" text-anchor="middle">' + (series[j].date || "") + '</text>';
     }
     html += '<text x="' + padding + '" y="16" fill="#94a3b8" font-size="12">最高 ' + max + '</text>';
@@ -783,6 +804,10 @@ export function adminHtml() {
       var yB = height - padding - barHeightB;
       html += '<rect x="' + baseX + '" y="' + yA + '" width="' + barWidth + '" height="' + barHeightA + '" fill="#2aabee" rx="3" />';
       html += '<rect x="' + (baseX + barWidth + gap) + '" y="' + yB + '" width="' + barWidth + '" height="' + barHeightB + '" fill="#94a3b8" rx="3" />';
+      var labelYA = Math.max(12, yA - 6);
+      var labelYB = Math.max(12, yB - 6);
+      html += '<text x="' + (baseX + barWidth / 2) + '" y="' + labelYA + '" fill="#0f172a" font-size="12" text-anchor="middle">' + series[j].count + '</text>';
+      html += '<text x="' + (baseX + barWidth + gap + barWidth / 2) + '" y="' + labelYB + '" fill="#0f172a" font-size="12" text-anchor="middle">' + series[j].users + '</text>';
       html += '<text x="' + (padding + slot * j + slot / 2) + '" y="' + (height - 8) + '" fill="#94a3b8" font-size="12" text-anchor="middle">' + (series[j].date || "") + '</text>';
     }
     html += '<text x="' + padding + '" y="16" fill="#94a3b8" font-size="12">最高 ' + max + '</text>';
@@ -795,17 +820,17 @@ export function adminHtml() {
       var d = await api("/api/admin/dashboard");
       var html = "";
       html += '<div class="dash-grid">';
-      html += '<div class="card dash-card" data-target="users" style="cursor:pointer"><div class="pill">全部用户</div><h2 class="dash-value">' + d.total_users + '</h2></div>';
-      html += '<div class="card dash-card" data-target="members" style="cursor:pointer"><div class="pill">会员用户</div><h2 class="dash-value">' + d.members + '</h2></div>';
-      html += '<div class="card dash-card" data-target="members" style="cursor:pointer"><div class="pill">即将到期</div><h2 class="dash-value">' + d.expiring_7d + '</h2></div>';
-      html += '<div class="card dash-card" data-target="members" style="cursor:pointer"><div class="pill">过期会员</div><h2 class="dash-value">' + d.expired + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本周关注</div><h2 class="dash-value">' + d.week_follow + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本月关注</div><h2 class="dash-value">' + d.month_follow + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本周搜图</div><h2 class="dash-value">' + d.week_images + '</h2></div>';
-      html += '<div class="card dash-card"><div class="pill">本月搜图</div><h2 class="dash-value">' + d.month_images + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本周新增用户</div><h2 class="dash-value">' + d.week_new_users + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本月新增用户</div><h2 class="dash-value">' + d.month_new_users + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本周搜图人数</div><h2 class="dash-value">' + d.week_image_users + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本月搜图人数</div><h2 class="dash-value">' + d.month_image_users + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本周新增会员</div><h2 class="dash-value">' + d.week_new_members + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本月新增会员</div><h2 class="dash-value">' + d.month_new_members + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本周搜图数量</div><h2 class="dash-value">' + d.week_images + '</h2></div>';
+      html += '<div class="card dash-card"><div class="pill">本月搜图数量</div><h2 class="dash-value">' + d.month_images + '</h2></div>';
       html += '</div>';
       $("dash").innerHTML = html;
-      renderBarChart("dashFollowChart", d.weekly_follow_series || []);
+      renderDoubleBarChart("dashFollowChart", d.weekly_new_series || []);
       renderDoubleBarChart("dashImageChart", d.weekly_image_series || []);
       var codes = $("dash").querySelectorAll("[data-target]");
       for (var i=0;i<codes.length;i++){
@@ -1354,7 +1379,10 @@ export function adminHtml() {
         rows += '<td><b>' + m.user_id + '</b></td>';
         rows += '<td>' + escapeHtml(m.verified_at || "") + '</td>';
         rows += '<td>' + escapeHtml(m.days_left_label || "") + '</td>';
-        rows += '<td class="cell-actions col-actions"><button class="gray action-btn" data-member="' + m.user_id + '">调整期限</button></td>';
+        rows += '<td class="cell-actions col-actions">';
+        rows += '<button class="gray action-btn" data-member="' + m.user_id + '">调整期限</button>';
+        rows += '<button class="red action-btn" data-delete="' + m.user_id + '">删除会员</button>';
+        rows += '</td>';
         rows += '</tr>';
       }
       $("memberTable").innerHTML = '<table class="table-edge center-2-4 compact-table"><thead><tr><th>用户昵称</th><th>用户ID</th><th>成为会员</th><th>会员余期</th><th class="col-actions">操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
@@ -1378,6 +1406,19 @@ export function adminHtml() {
           }
         };
       }
+      var deleteBtns = $("memberTable").querySelectorAll("button[data-delete]");
+      for (var k=0;k<deleteBtns.length;k++){
+        deleteBtns[k].onclick = async function(){
+          var userId = this.getAttribute("data-delete");
+          if (!confirm("确认删除该会员？")) return;
+          try{
+            await api("/api/admin/memberships/" + encodeURIComponent(userId), { method:"DELETE" });
+            loadMembers();
+          }catch(e){
+            alert("删除失败：" + e.message);
+          }
+        };
+      }
       renderPagination("memberPagination", d.page || memberPage, d.total_pages || 1, function(p){
         memberPage = p;
         loadMembers();
@@ -1391,6 +1432,25 @@ export function adminHtml() {
     memberQuery = $("memberSearch").value.trim();
     memberPage = 1;
     loadMembers();
+  };
+
+  $("memberAddBtn").onclick = async function(){
+    var userId = Number($("memberAddId").value.trim());
+    var daysLeft = Number($("memberAddDays").value.trim() || "36500");
+    if (!Number.isFinite(userId)) return alert("请输入有效的用户ID");
+    if (!Number.isFinite(daysLeft)) return alert("请输入有效的会员天数");
+    try{
+      await api("/api/admin/memberships", {
+        method:"POST",
+        headers:{ "content-type":"application/json" },
+        body: JSON.stringify({ user_id: userId, days_left: daysLeft })
+      });
+      $("memberAddId").value = "";
+      $("memberAddDays").value = "";
+      loadMembers();
+    }catch(e){
+      alert("添加失败：" + e.message);
+    }
   };
 
   // Users
@@ -1555,18 +1615,12 @@ export async function adminApi(env, req, pathname) {
     const weekStart = getTzWeekStart(now, tz);
     const nextWeekStart = weekStart + 7 * 86400;
     const lastWeekStart = weekStart - 7 * 86400;
-
-    const total_users = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users`).first()).c;
-    const members = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE expire_at > ?`).bind(now).first()).c;
-    const expiring_7d = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE expire_at BETWEEN ? AND ?`).bind(now, now + 7 * 86400).first()).c;
-    const expired = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE expire_at <= ?`).bind(now).first()).c;
-    const week_follow = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
-    const week_unsub = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE can_dm=0 AND last_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
-    const last_week_follow = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(lastWeekStart, weekStart).first()).c;
-    const last_week_unsub = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE can_dm=0 AND last_seen_at BETWEEN ? AND ?`).bind(lastWeekStart, weekStart).first()).c;
+    const week_new_users = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
+    const week_new_members = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE verified_at BETWEEN ? AND ?`).bind(weekStart, nextWeekStart).first()).c;
     const tzParts = getTzParts(new Date(now * 1000), tz);
     const monthStart = todayStart - (tzParts.day - 1) * 86400;
-    const month_follow = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(monthStart, tomorrowStart).first()).c;
+    const month_new_users = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM users WHERE first_seen_at BETWEEN ? AND ?`).bind(monthStart, tomorrowStart).first()).c;
+    const month_new_members = (await getDb(env).prepare(`SELECT COUNT(*) AS c FROM memberships WHERE verified_at BETWEEN ? AND ?`).bind(monthStart, tomorrowStart).first()).c;
     const weekSeriesStart = todayStart - 6 * 86400;
     const weekRows = await getDb(env).prepare(
       `SELECT first_seen_at FROM users WHERE first_seen_at BETWEEN ? AND ?`
@@ -1576,17 +1630,27 @@ export async function adminApi(env, req, pathname) {
       const key = getTzDateKey(row.first_seen_at, tz);
       weekBuckets[key] = (weekBuckets[key] || 0) + 1;
     }
-    const weekly_follow_series = [];
+    const memberRows = await getDb(env).prepare(
+      `SELECT verified_at FROM memberships WHERE verified_at BETWEEN ? AND ?`
+    ).bind(weekSeriesStart, tomorrowStart - 1).all();
+    const memberBuckets = {};
+    for (const row of (memberRows.results || [])) {
+      const key = getTzDateKey(row.verified_at, tz);
+      memberBuckets[key] = (memberBuckets[key] || 0) + 1;
+    }
+    const weekly_new_series = [];
     for (let i = 0; i < 7; i++) {
       const dayStart = weekSeriesStart + i * 86400;
       const key = getTzDateKey(dayStart, tz);
       const labelParts = key.split("-");
       const label = `${labelParts[1]}-${labelParts[2]}`;
-      weekly_follow_series.push({ date: label, count: weekBuckets[key] || 0 });
+      weekly_new_series.push({ date: label, count: weekBuckets[key] || 0, users: memberBuckets[key] || 0 });
     }
     const kv = getKv(env);
     let week_images = 0;
     let month_images = 0;
+    let week_image_users = 0;
+    let month_image_users = 0;
     const weekly_image_series = [];
     for (let i = 0; i < 7; i++) {
       const dayStart = weekSeriesStart + i * 86400;
@@ -1601,26 +1665,25 @@ export async function adminApi(env, req, pathname) {
     for (let i = 0; i < weekDays; i++) {
       const key = getTzDateKey(weekStart + i * 86400, tz);
       week_images += Number(await kv.get(`image_total:${key}`) || 0);
+      week_image_users += Number(await kv.get(`image_user_total:${key}`) || 0);
     }
     const monthDays = Math.max(0, Math.floor((tomorrowStart - monthStart) / 86400));
     for (let i = 0; i < monthDays; i++) {
       const key = getTzDateKey(monthStart + i * 86400, tz);
       month_images += Number(await kv.get(`image_total:${key}`) || 0);
+      month_image_users += Number(await kv.get(`image_user_total:${key}`) || 0);
     }
     return new Response(JSON.stringify({
       ok:true,
-      total_users,
-      members,
-      expiring_7d,
-      expired,
-      week_follow,
-      week_unsub,
-      last_week_follow,
-      last_week_unsub,
-      month_follow,
+      week_new_users,
+      month_new_users,
+      week_new_members,
+      month_new_members,
       week_images,
       month_images,
-      weekly_follow_series,
+      week_image_users,
+      month_image_users,
+      weekly_new_series,
       weekly_image_series
     }), { headers: JSON_HEADERS });
   }
@@ -1801,6 +1864,24 @@ export async function adminApi(env, req, pathname) {
   }
 
   // Memberships
+  if (pathname === "/api/admin/memberships" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const targetId = Number(body.user_id);
+    if (!Number.isFinite(targetId)) return new Response(JSON.stringify({ ok:false, error:"用户ID无效" }), { status: 400, headers: JSON_HEADERS });
+    const daysLeftRaw = body.days_left;
+    const daysLeft = Number.isFinite(Number(daysLeftRaw)) ? Number(daysLeftRaw) : GROUP_MEMBER_EXPIRE_DAYS;
+    if (!Number.isFinite(daysLeft)) return new Response(JSON.stringify({ ok:false, error:"天数无效" }), { status: 400, headers: JSON_HEADERS });
+    const t = nowSec();
+    const expireAt = t + Math.max(0, Math.floor(daysLeft)) * 86400;
+    await ensureUserById(env, targetId);
+    await getDb(env).prepare(
+      `INSERT INTO memberships(user_id,verified_at,expire_at,updated_at)
+       VALUES (?,?,?,?)
+       ON CONFLICT(user_id) DO UPDATE SET expire_at=excluded.expire_at, updated_at=excluded.updated_at`
+    ).bind(targetId, t, expireAt, t).run();
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
+  }
+
   if (pathname === "/api/admin/memberships" && req.method === "GET") {
     const q = (url.searchParams.get("q") || "").trim();
     const page = Math.max(1, Number(url.searchParams.get("page") || 1));
@@ -1810,20 +1891,20 @@ export async function adminApi(env, req, pathname) {
     let bind = [];
     if (q) {
       const like = `%${q}%`;
-      where = "WHERE CAST(u.user_id AS TEXT) LIKE ? OR u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?";
+      where = "WHERE CAST(m.user_id AS TEXT) LIKE ? OR u.username LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?";
       bind = [like, like, like, like];
     }
     const countRow = await getDb(env).prepare(
       `SELECT COUNT(*) AS c
        FROM memberships m
-       JOIN users u ON u.user_id=m.user_id
+       LEFT JOIN users u ON u.user_id=m.user_id
        ${where}`
     ).bind(...bind).first();
     const total = countRow?.c || 0;
     const rows = await getDb(env).prepare(
       `SELECT m.user_id,m.verified_at,m.expire_at,u.username,u.first_name,u.last_name
        FROM memberships m
-       JOIN users u ON u.user_id=m.user_id
+       LEFT JOIN users u ON u.user_id=m.user_id
        ${where}
        ORDER BY m.expire_at DESC
        LIMIT ? OFFSET ?`
@@ -1858,11 +1939,19 @@ export async function adminApi(env, req, pathname) {
     if (!Number.isFinite(daysLeft)) return new Response(JSON.stringify({ ok:false, error:"天数无效" }), { status: 400, headers: JSON_HEADERS });
     const t = nowSec();
     const expireAt = t + Math.max(0, Math.floor(daysLeft)) * 86400;
+    await ensureUserById(env, targetId);
     await getDb(env).prepare(
       `INSERT INTO memberships(user_id,verified_at,expire_at,updated_at)
        VALUES (?,?,?,?)
        ON CONFLICT(user_id) DO UPDATE SET expire_at=excluded.expire_at, updated_at=excluded.updated_at`
     ).bind(targetId, t, expireAt, t).run();
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname.startsWith("/api/admin/memberships/") && req.method === "DELETE") {
+    const targetId = Number(decodeURIComponent(pathname.split("/").pop()));
+    if (!Number.isFinite(targetId)) return new Response(JSON.stringify({ ok:false, error:"用户ID无效" }), { status: 400, headers: JSON_HEADERS });
+    await getDb(env).prepare(`DELETE FROM memberships WHERE user_id=?`).bind(targetId).run();
     return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
