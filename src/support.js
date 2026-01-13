@@ -6,7 +6,18 @@ import {
   JSON_HEADERS,
   GROUP_MEMBER_EXPIRE_DAYS,
 } from "./config.js";
-import { ensureUser, getDb, getTemplate, upsertManagedChat } from "./db.js";
+import {
+  addManagedChat,
+  ensureUser,
+  getDb,
+  getTemplate,
+  isManagedChatEnabled,
+  listManagedChats,
+  markUserChatRemoved,
+  updateManagedChatStatus,
+  upsertManagedChat,
+  upsertUserChatMembership,
+} from "./db.js";
 import { getKv } from "./kv.js";
 import {
   buildImageSearchLinks,
@@ -57,12 +68,27 @@ async function sendStartTemplate(env, userId) {
   });
 }
 
-async function markGroupUserAsMember(env, user) {
+async function markManagedChatUserAsMember(env, chat, user) {
+  const chatId = chat?.id;
   const userId = user?.id;
-  if (!Number.isFinite(userId)) return;
+  if (!Number.isFinite(chatId) || !Number.isFinite(userId)) return;
+  if (!await isManagedChatEnabled(env, chatId)) return;
   await ensureUser(env, user);
+  await upsertUserChatMembership(env, userId, chatId);
   const expireAt = nowSec() + GROUP_MEMBER_EXPIRE_DAYS * 86400;
   await ensureMembershipThrough(env, userId, expireAt);
+}
+
+async function shouldNotifyDailyLimit(env, userId) {
+  if (!Number.isFinite(userId)) return false;
+  const dayKey = getTzDateKey(nowSec(), env.TZ);
+  const key = `search_limit_warn:${dayKey}:${userId}`;
+  const kv = getKv(env);
+  if (!kv) return false;
+  const warned = await kv.get(key);
+  if (warned) return false;
+  await kv.put(key, "1", { expirationTtl: 2 * 86400 });
+  return true;
 }
 
 async function handleImageOrVideoMessage(env, msg, requestUrlString) {
@@ -70,7 +96,7 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
   if (!Number.isFinite(userId)) return false;
   if (isVideoMessage(msg)) {
     const warned = await shouldNotifyVideoWarning(env, userId);
-    if (warned || await shouldNotifyCooldown(env, `video_warn_cd:${userId}`, 600)) {
+    if (warned) {
       await tgCall(env, "sendMessage", { chat_id: userId, text: "本机器人只支持图片搜索哦～" });
     }
     return true;
@@ -81,9 +107,7 @@ async function handleImageOrVideoMessage(env, msg, requestUrlString) {
   const member = await isMember(env, userId);
   const searchStatus = await getDailySearchStatus(env, userId, member);
   if (!searchStatus.allowed) {
-    if (member) {
-      await tgCall(env, "sendMessage", { chat_id: userId, text: "服务器异常，请稍后再尝试搜索。" });
-    } else {
+    if (await shouldNotifyDailyLimit(env, userId)) {
       await sendStartTemplate(env, userId);
     }
     return true;
@@ -144,22 +168,12 @@ function bufferSearchMediaGroup(env, msg, requestUrlString) {
       return;
     }
     const userId = currentEntry.userId;
-    if (Number.isFinite(userId) && (await shouldNotifyMediaGroup(env, userId, groupId)
-      || await shouldNotifyCooldown(env, `media_group_cd:${userId}`, 600))) {
+    if (Number.isFinite(userId) && await shouldNotifyMediaGroup(env, userId, groupId)) {
       await tgCall(env, "sendMessage", { chat_id: userId, text: "请发送一张图片进行搜索哦～" });
     }
     currentEntry.resolve?.(true);
   }, SEARCH_MEDIA_GROUP_BUFFER_MS);
   return entry.promise;
-}
-
-async function shouldNotifyCooldown(env, key, ttlSec) {
-  const kv = getKv(env);
-  if (!kv) return true;
-  const notified = await kv.get(key);
-  if (notified) return false;
-  await kv.put(key, "1", { expirationTtl: ttlSec });
-  return true;
 }
 
 async function handleBotAddedToChat(env, chat, inviterId) {
@@ -176,6 +190,8 @@ async function handleBotAddedToChat(env, chat, inviterId) {
 async function handleGroupMessage(env, msg) {
   const chatType = msg?.chat?.type;
   if (!["group", "supergroup", "channel"].includes(chatType)) return false;
+  const chatId = msg?.chat?.id;
+  if (!Number.isFinite(chatId)) return false;
   const botId = getBotUserId(env);
   if (botId && Array.isArray(msg?.new_chat_members)) {
     const addedBot = msg.new_chat_members.some(member => member?.id === botId);
@@ -184,15 +200,16 @@ async function handleGroupMessage(env, msg) {
       return true;
     }
   }
+  if (!await isManagedChatEnabled(env, chatId)) return false;
   if (Array.isArray(msg?.new_chat_members)) {
     for (const member of msg.new_chat_members) {
       if (member?.id && member.id !== botId) {
-        await markGroupUserAsMember(env, member);
+        await markManagedChatUserAsMember(env, msg.chat, member);
       }
     }
   }
   if (msg.from?.id && msg.from.id !== botId) {
-    await markGroupUserAsMember(env, msg.from);
+    await markManagedChatUserAsMember(env, msg.chat, msg.from);
   }
   return true;
 }
@@ -207,6 +224,28 @@ async function handleBotChatMemberUpdate(env, payload) {
   if (!["member", "administrator"].includes(status)) return false;
   await handleBotAddedToChat(env, chat, payload?.from?.id);
   return true;
+}
+
+async function handleChatMemberUpdate(env, payload) {
+  const chat = payload?.chat;
+  const user = payload?.new_chat_member?.user;
+  const chatId = chat?.id;
+  const userId = user?.id;
+  if (!Number.isFinite(chatId) || !Number.isFinite(userId)) return false;
+  if (!await isManagedChatEnabled(env, chatId)) return false;
+  const newStatus = payload?.new_chat_member?.status || "";
+  const oldStatus = payload?.old_chat_member?.status || "";
+  const isMemberNow = ["member", "administrator", "creator"].includes(newStatus);
+  const wasMember = ["member", "administrator", "creator"].includes(oldStatus);
+  if (isMemberNow && !wasMember) {
+    await markManagedChatUserAsMember(env, chat, user);
+    return true;
+  }
+  if (!isMemberNow && wasMember) {
+    await markUserChatRemoved(env, userId, chatId);
+    return true;
+  }
+  return false;
 }
 /** Admin login: /login in bot DM generates a one-time link */
 export async function handleAdminLoginCommand(env, msg, origin) {
@@ -379,6 +418,7 @@ export function adminHtml() {
         <a href="#dashboard" id="nav-dashboard">数据看板</a>
         <a href="#templates" id="nav-templates">回复模版</a>
         <a href="#broadcast" id="nav-broadcast">广播中心</a>
+        <a href="#managed-chats" id="nav-managed-chats">群组管理</a>
         <a href="#members" id="nav-members">会员管理</a>
         <a href="#users" id="nav-users">用户管理</a>
       </nav>
@@ -524,6 +564,34 @@ export function adminHtml() {
         <div id="bcJobs"></div>
       </div>
 
+      <div class="card hidden" id="view-managed-chats">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <h3 style="margin:0">群组管理</h3>
+        </div>
+        <div class="row chat-edit-grid">
+          <div class="field">
+            <label>群组/频道ID</label>
+            <input id="managedChatId" placeholder="-1001234567890" />
+          </div>
+          <div class="field">
+            <label>类型</label>
+            <select id="managedChatType">
+              <option value="group">群组</option>
+              <option value="channel">频道</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>备注标题</label>
+            <input id="managedChatTitle" placeholder="可选" />
+          </div>
+          <div class="chat-edit-actions">
+            <button id="managedChatAdd">添加群组</button>
+          </div>
+        </div>
+        <p class="muted">已添加的群组/频道将参与成员扫描与入群同步。</p>
+        <div id="managedChatTable"></div>
+      </div>
+
       <div class="card hidden" id="view-members">
         <div class="row" style="justify-content:space-between;align-items:center">
           <h3 style="margin:0">会员管理</h3>
@@ -554,7 +622,7 @@ export function adminHtml() {
 
 <script>
   function $(id){ return document.getElementById(id); }
-  var views = ["login","dashboard","templates","template-editor","broadcast","members","users"];
+  var views = ["login","dashboard","templates","template-editor","broadcast","managed-chats","members","users"];
   var IMAGE_REPLY_TEMPLATE_KEY = ${JSON.stringify(IMAGE_REPLY_TEMPLATE_KEY)};
   var IMAGE_REPLY_DEFAULT_TEXT = ${JSON.stringify(IMAGE_REPLY_DEFAULT_TEXT)};
   var IMAGE_REPLY_DEFAULT_BUTTONS = ${JSON.stringify(IMAGE_REPLY_DEFAULT_BUTTONS)};
@@ -570,6 +638,7 @@ export function adminHtml() {
     if(name==="templates") loadTemplates();
     if(name==="template-editor") loadTemplateEditorFromUrl();
     if(name==="broadcast") { loadBroadcastJobs(); loadTemplateTitles().then(function(){ updateTemplateTitleDisplay($("bcTplKey").value.trim(), "bcTplTitle"); }); }
+    if(name==="managed-chats") loadManagedChats();
     if(name==="members") loadMembers();
     if(name==="users") loadUsers();
     if(name==="login") { startLogin(); }
@@ -1190,6 +1259,64 @@ export function adminHtml() {
     }
   };
 
+  // Managed chats
+  async function loadManagedChats(){
+    try{
+      var d = await api("/api/admin/managed-chats");
+      var rows = "";
+      var items = d.items || [];
+      for (var i=0;i<items.length;i++){
+        var c = items[i];
+        rows += '<tr>';
+        rows += '<td><b>' + c.chat_id + '</b></td>';
+        rows += '<td>' + escapeHtml(c.chat_type || "") + '</td>';
+        rows += '<td>' + escapeHtml(c.title || "") + '</td>';
+        rows += '<td>' + (c.is_enabled ? "启用" : "禁用") + '</td>';
+        rows += '<td class="col-actions"><button class="gray action-btn" data-chat="' + c.chat_id + '" data-enabled="' + (c.is_enabled ? "1" : "0") + '">' + (c.is_enabled ? "禁用" : "启用") + '</button></td>';
+        rows += '</tr>';
+      }
+      $("managedChatTable").innerHTML = '<table class="table-edge compact-table"><thead><tr><th>群组ID</th><th>类型</th><th>备注</th><th>状态</th><th class="col-actions">操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      var btns = $("managedChatTable").querySelectorAll("button[data-chat]");
+      for (var j=0;j<btns.length;j++){
+        btns[j].onclick = async function(){
+          var chatId = this.getAttribute("data-chat");
+          var enabled = this.getAttribute("data-enabled") === "1";
+          try{
+            await api("/api/admin/managed-chats/" + encodeURIComponent(chatId), {
+              method:"PUT",
+              headers:{ "content-type":"application/json" },
+              body: JSON.stringify({ is_enabled: enabled ? 0 : 1 })
+            });
+            await loadManagedChats();
+          }catch(e){
+            alert("更新失败：" + e.message);
+          }
+        };
+      }
+    }catch(e){
+      $("managedChatTable").textContent = "请先登录。";
+    }
+  }
+
+  $("managedChatAdd").onclick = async function(){
+    var chatId = Number($("managedChatId").value.trim());
+    if (!Number.isFinite(chatId)) return alert("请输入有效的群组/频道ID");
+    var chatType = $("managedChatType").value;
+    var title = $("managedChatTitle").value.trim();
+    try{
+      await api("/api/admin/managed-chats", {
+        method:"POST",
+        headers:{ "content-type":"application/json" },
+        body: JSON.stringify({ chat_id: chatId, chat_type: chatType, title: title })
+      });
+      $("managedChatId").value = "";
+      $("managedChatTitle").value = "";
+      await loadManagedChats();
+    }catch(e){
+      alert("添加失败：" + e.message);
+    }
+  };
+
 
   (async function(){
     var userId = await whoami();
@@ -1519,7 +1646,7 @@ export async function adminApi(env, req, pathname) {
     }
     await tgCall(env, "setWebhook", {
       url,
-      allowed_updates: ["message", "callback_query"],
+      allowed_updates: ["message", "callback_query", "chat_member", "my_chat_member"],
     });
     return new Response(JSON.stringify({ ok:true, url }), { headers: JSON_HEADERS });
   }
@@ -1638,6 +1765,39 @@ export async function adminApi(env, req, pathname) {
       fail: r.fail
     }));
     return new Response(JSON.stringify({ ok:true, items }), { headers: JSON_HEADERS });
+  }
+
+  // Managed chats
+  if (pathname === "/api/admin/managed-chats" && req.method === "GET") {
+    const rows = await listManagedChats(env);
+    const items = rows.map(r => ({
+      chat_id: r.chat_id,
+      chat_type: r.chat_type,
+      title: r.title || "",
+      is_enabled: r.is_enabled === 1,
+      created_at: fmtDateTime(r.created_at, env.TZ)
+    }));
+    return new Response(JSON.stringify({ ok:true, items }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname === "/api/admin/managed-chats" && req.method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const chatId = Number(body.chat_id);
+    const chatType = String(body.chat_type || "").trim();
+    const title = String(body.title || "").trim();
+    if (!Number.isFinite(chatId)) return new Response(JSON.stringify({ ok:false, error:"群组ID无效" }), { status: 400, headers: JSON_HEADERS });
+    if (!["group", "channel"].includes(chatType)) return new Response(JSON.stringify({ ok:false, error:"类型无效" }), { status: 400, headers: JSON_HEADERS });
+    await addManagedChat(env, chatId, chatType, title, 1);
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
+  }
+
+  if (pathname.startsWith("/api/admin/managed-chats/") && req.method === "PUT") {
+    const chatId = Number(decodeURIComponent(pathname.split("/").pop()));
+    if (!Number.isFinite(chatId)) return new Response(JSON.stringify({ ok:false, error:"群组ID无效" }), { status: 400, headers: JSON_HEADERS });
+    const body = await req.json().catch(() => ({}));
+    const isEnabled = Number(body.is_enabled || 0) ? 1 : 0;
+    await updateManagedChatStatus(env, chatId, isEnabled);
+    return new Response(JSON.stringify({ ok:true }), { headers: JSON_HEADERS });
   }
 
   // Memberships
@@ -1772,10 +1932,14 @@ export async function handleWebhook(env, update, requestUrl) {
   const msg = update.message;
   const cbq = update.callback_query;
   const myChatMember = update.my_chat_member;
+  const chatMember = update.chat_member;
 
   if (msg && msg.from?.id) await ensureUser(env, msg.from);
   if (myChatMember) {
     await handleBotChatMemberUpdate(env, myChatMember);
+  }
+  if (chatMember) {
+    await handleChatMemberUpdate(env, chatMember);
   }
 
   // Callback query buttons

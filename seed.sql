@@ -101,10 +101,11 @@ strftime('%s','now')),
 ]',
 strftime('%s','now')),
 
-('image_reply','图片回复模版','HTML',1,'自助搜图，具体内容点击下方按钮～',
+('image_reply','图片回复模版','HTML',1,'搜图结果自行点击下方按钮查看哦～',
 '[
   [{"text":"GoogleLens → 看看这是谁","type":"url","url":"{{google_lens}}"}],
-  [{"text":"Yandex.ru → 想找图片来源","type":"url","url":"{{yandex}}"}]
+  [{"text":"Yandex.ru → 想找图片来源","type":"url","url":"{{yandex}}"}],
+  [{"text":"情色百科 → 同人作品搜索","type":"url","url":"https://t.me/+Or5eQlGIEA1mYmM1"}]
 ]',
 strftime('%s','now'));
 
@@ -117,7 +118,7 @@ INSERT OR IGNORE INTO image_hosts (base_url,is_enabled,fail_count,is_faulty,crea
 
 -- Settings
 INSERT OR IGNORE INTO settings (key,value,updated_at) VALUES
-('image_reply_template','自助搜图，具体内容点击下方按钮～',strftime('%s','now'));
+('image_reply_template','搜图结果自行点击下方按钮查看哦～',strftime('%s','now'));
 
 -- Auto rules (enable what you want in admin)
 INSERT OR IGNORE INTO auto_rules(rule_key,kind,offset_days,template_key,is_enabled) VALUES
